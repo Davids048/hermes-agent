@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Optional
 import aiohttp
 import yaml
 
+from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
 from hermes_constants import get_hermes_home
 
 
@@ -34,6 +35,8 @@ _ROLLOUT_RETRY_INITIAL_DELAY_SECONDS = 0.5
 _ROLLOUT_RETRY_MAX_DELAY_SECONDS = 30.0
 _STREAM_EDIT_INTERVAL_SECONDS = 0.75
 _HISTORY_PAGE_SIZE = 100
+_DISCORD_THREAD_TITLE_MAX_UTF16_UNITS = 80
+_DISCORD_THREAD_TITLE_SEPARATOR = " | "
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -54,6 +57,76 @@ def _is_missing_rollout_error(error: CodexRpcError, thread_id: str) -> bool:
     """Match the transient resume error emitted before a rollout is durable."""
     expected = f"no rollout found for thread id {thread_id}"
     return error.message == expected
+
+
+def _truncate_utf16_prefix(text: str, limit: int) -> str:
+    """Truncate a title component from the right within a UTF-16 budget."""
+    if utf16_len(text) <= limit:
+        return text
+    if limit <= 3:
+        return _prefix_within_utf16_limit(text, limit)
+    return _prefix_within_utf16_limit(text, limit - 3).rstrip() + "..."
+
+
+def _truncate_utf16_suffix(text: str, limit: int) -> str:
+    """Truncate a path label from the left within a UTF-16 budget."""
+    if utf16_len(text) <= limit:
+        return text
+    if limit <= 3:
+        return _prefix_within_utf16_limit(text[::-1], limit)[::-1]
+    suffix = _prefix_within_utf16_limit(text[::-1], limit - 3)[::-1].lstrip()
+    return "..." + suffix
+
+
+def _parent_and_working_directory(cwd: str) -> str:
+    """Return the final two path components for a Codex working directory."""
+    path = Path(str(cwd or "."))
+    parts = list(path.parts)
+    if path.anchor and parts and parts[0] == path.anchor:
+        parts = parts[1:]
+    if not parts:
+        return path.anchor or "."
+    return "/".join(parts[-2:])
+
+
+def _discord_thread_title(
+    name: str,
+    cwd: str,
+    codex_thread_id: str,
+    *,
+    working: bool = False,
+) -> str:
+    """Render a status-prefixed task identity within Discord's title limit."""
+    cleaned_name = re.sub(r"\s+", " ", str(name or "Untitled task")).strip()
+    cleaned_name = cleaned_name or "Untitled task"
+    directory = re.sub(
+        r"\s+", " ", _parent_and_working_directory(cwd)
+    ).strip()
+    session_id = str(codex_thread_id or "").strip()
+    if not session_id:
+        raise ValueError("A Discord Codex thread title requires a session id")
+
+    status_prefix = "⏳ " if working else "✅ "
+    separator_units = utf16_len(_DISCORD_THREAD_TITLE_SEPARATOR)
+    fixed_units = (
+        utf16_len(status_prefix) + utf16_len(session_id) + 2 * separator_units
+    )
+    # Reserve two UTF-16 units so any first Unicode code point can remain.
+    directory_budget = _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS - fixed_units - 2
+    if directory_budget < 1:
+        raise ValueError("The Codex session id exceeds the Discord title budget")
+    directory = _truncate_utf16_suffix(directory, directory_budget)
+    suffix = (
+        f"{_DISCORD_THREAD_TITLE_SEPARATOR}{directory}"
+        f"{_DISCORD_THREAD_TITLE_SEPARATOR}{session_id}"
+    )
+    name_budget = (
+        _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS
+        - utf16_len(status_prefix)
+        - utf16_len(suffix)
+    )
+    displayed_name = _truncate_utf16_prefix(cleaned_name, name_budget)
+    return f"{status_prefix}{displayed_name}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -131,6 +204,7 @@ class CodexTaskBinding:
     codex_thread_id: str
     cwd: str
     title: str = ""
+    discord_title: str = ""
     guild_id: Optional[str] = None
     parent_chat_id: Optional[str] = None
     item_deliveries: dict[str, CodexItemDelivery] = field(default_factory=dict)
@@ -742,6 +816,7 @@ class DiscordCodexGateway:
             codex_thread_id=thread_id,
             cwd=str(result.get("cwd") or self.settings.default_cwd),
             title=title,
+            discord_title=title,
             guild_id=getattr(source, "guild_id", None),
             parent_chat_id=getattr(source, "parent_chat_id", None),
         )
@@ -751,6 +826,7 @@ class DiscordCodexGateway:
             await self.client.request(
                 "thread/name/set", {"threadId": thread_id, "name": title}
             )
+        await self._rename_bound_task(thread_id, title, cwd=binding.cwd)
         return binding
 
     async def _new_from_command(self, event: Any, cwd_arg: str) -> str:
@@ -766,21 +842,39 @@ class DiscordCodexGateway:
         if not thread_id:
             raise RuntimeError("Codex thread/start returned no task id")
         source = event.source
-        title = str(getattr(source, "chat_name", None) or "Discord Codex task")
+        chat_id = str(source.chat_id)
+        previous_binding = self.bindings.bindings.get(chat_id)
+        source_title = str(
+            getattr(source, "chat_name", None) or "Discord Codex task"
+        )
+        hermes_owned_title = (
+            (previous_binding.discord_title or previous_binding.title)
+            if previous_binding is not None
+            else ""
+        )
+        title = (
+            previous_binding.title
+            if previous_binding is not None
+            and previous_binding.title
+            and source_title == hermes_owned_title
+            else source_title
+        )
+        current_discord_title = hermes_owned_title or source_title
         with suppress(Exception):
             await self.client.request(
                 "thread/name/set", {"threadId": thread_id, "name": title}
             )
-        self.bindings.bind(
-            CodexTaskBinding(
-                discord_chat_id=str(source.chat_id),
-                codex_thread_id=thread_id,
-                cwd=str(result.get("cwd") or cwd),
-                title=title,
-                guild_id=getattr(source, "guild_id", None),
-                parent_chat_id=getattr(source, "parent_chat_id", None),
-            )
+        binding = CodexTaskBinding(
+            discord_chat_id=chat_id,
+            codex_thread_id=thread_id,
+            cwd=str(result.get("cwd") or cwd),
+            title=title,
+            discord_title=current_discord_title,
+            guild_id=getattr(source, "guild_id", None),
+            parent_chat_id=getattr(source, "parent_chat_id", None),
         )
+        self.bindings.bind(binding)
+        await self._rename_bound_task(thread_id, title, cwd=binding.cwd)
         self._gateway_started_thread_ids.discard(thread_id)
         return f"Created and attached Codex task `{thread_id}` in `{cwd}`."
 
@@ -826,15 +920,21 @@ class DiscordCodexGateway:
             thread_id = str(tasks[0].get("id") or "")
             title = self._task_title(tasks[0])
         source = event.source
+        previous = self.bindings.bindings.get(str(source.chat_id))
+        current_discord_title = str(getattr(source, "chat_name", None) or "")
+        if previous is not None:
+            current_discord_title = (
+                previous.discord_title or previous.title or current_discord_title
+            )
         provisional = CodexTaskBinding(
             discord_chat_id=str(source.chat_id),
             codex_thread_id=thread_id,
             cwd=str(self.settings.default_cwd),
             title=title,
+            discord_title=current_discord_title,
             guild_id=getattr(source, "guild_id", None),
             parent_chat_id=getattr(source, "parent_chat_id", None),
         )
-        previous = self.bindings.bindings.get(provisional.discord_chat_id)
         displaced = [
             stored
             for chat_id, stored in self.bindings.bindings.items()
@@ -851,10 +951,7 @@ class DiscordCodexGateway:
             for binding in displaced:
                 self.bindings.bind(binding)
             raise
-        thread = result.get("thread", {}) if isinstance(result, dict) else {}
-        provisional.title = self._task_title(thread) or provisional.title
-        provisional.cwd = str(result.get("cwd") or provisional.cwd)
-        self.bindings.bind(provisional)
+        provisional = await self._synchronize_binding_metadata(provisional, result)
         return (
             f"Attached to Codex task `{thread_id}`"
             + (f" — **{provisional.title}**" if provisional.title else "")
@@ -905,16 +1002,34 @@ class DiscordCodexGateway:
                     "again after the first prompt starts."
                 )
             return f"Could not refresh Codex task `{binding.codex_thread_id}`: {error.message}"
-        thread = result.get("thread", {}) if isinstance(result, dict) else {}
-        if isinstance(thread, dict) and (thread.get("name") or thread.get("preview")):
-            title = self._task_title(thread)
-            if title != binding.title:
-                await self._rename_bound_task(binding.codex_thread_id, title)
-                binding = self.bindings.bindings.get(chat_id, binding)
-        binding.cwd = str(result.get("cwd") or thread.get("cwd") or binding.cwd)
-        self.bindings.bind(binding)
+        binding = await self._synchronize_binding_metadata(binding, result)
         status = await self._status_text(chat_id)
         return f"Refreshed Codex task `{binding.codex_thread_id}`.\n{status}"
+
+    async def _synchronize_binding_metadata(
+        self,
+        binding: CodexTaskBinding,
+        resume_result: dict[str, Any],
+    ) -> CodexTaskBinding:
+        """Align one binding and its Discord title with resumed Codex metadata."""
+        thread = (
+            resume_result.get("thread", {})
+            if isinstance(resume_result, dict)
+            else {}
+        )
+        title = binding.title
+        if isinstance(thread, dict) and (thread.get("name") or thread.get("preview")):
+            title = self._task_title(thread)
+        cwd = str(
+            resume_result.get("cwd")
+            or (thread.get("cwd") if isinstance(thread, dict) else "")
+            or binding.cwd
+        )
+        await self._rename_bound_task(binding.codex_thread_id, title, cwd=cwd)
+        synchronized = self.bindings.bindings.get(binding.discord_chat_id, binding)
+        synchronized.cwd = cwd
+        self.bindings.bind(synchronized)
+        return synchronized
 
     async def _interrupt_task(self, chat_id: str) -> str:
         """Interrupt the exact active Codex turn attached to a Discord thread."""
@@ -923,7 +1038,8 @@ class DiscordCodexGateway:
             return "This Discord thread is not attached to a Codex task."
         turn_id = self.active_turns.get(binding.codex_thread_id)
         if turn_id is None:
-            await self._resume_binding(binding)
+            await self._resume_binding(binding, show_activity=False)
+            await self._update_bound_task_status(binding.codex_thread_id)
             turn_id = self.active_turns.get(binding.codex_thread_id)
         if turn_id is None:
             return "The Codex task is idle."
@@ -962,7 +1078,7 @@ class DiscordCodexGateway:
             else:
                 result = await self.client.request("turn/start", params)
         except CodexRpcError:
-            await self._resume_binding(binding)
+            await self._resume_binding(binding, show_activity=False)
             turn_id = self.active_turns.get(binding.codex_thread_id)
             if turn_id:
                 result = await self.client.request(
@@ -974,6 +1090,7 @@ class DiscordCodexGateway:
         returned_turn_id = str(turn.get("id") or "")
         if returned_turn_id:
             self.active_turns[binding.codex_thread_id] = returned_turn_id
+            await self._update_bound_task_status(binding.codex_thread_id)
 
     def _codex_inputs(self, event: Any) -> list[dict[str, Any]]:
         """Convert Discord text and cached media paths into Codex user inputs."""
@@ -998,7 +1115,8 @@ class DiscordCodexGateway:
         )
         for binding in bindings:
             try:
-                await self._resume_and_sync_binding(binding)
+                result = await self._resume_and_sync_binding(binding)
+                await self._synchronize_binding_metadata(binding, result)
             except Exception:
                 logger.exception(
                     "Could not synchronize mapped Codex task %s",
@@ -1160,7 +1278,12 @@ class DiscordCodexGateway:
         if status != "inProgress":
             self.turn_displays.pop(key, None)
 
-    async def _resume_binding(self, binding: CodexTaskBinding) -> dict[str, Any]:
+    async def _resume_binding(
+        self,
+        binding: CodexTaskBinding,
+        *,
+        show_activity: bool = True,
+    ) -> dict[str, Any]:
         """Subscribe to one task and recover its active turn identity."""
         result = await self.client.request(
             "thread/resume",
@@ -1177,7 +1300,10 @@ class DiscordCodexGateway:
         active_turn_id = self._active_turn_id(result)
         if active_turn_id:
             self.active_turns[binding.codex_thread_id] = active_turn_id
-            if binding.codex_thread_id not in self._history_syncing_thread_ids:
+            if (
+                show_activity
+                and binding.codex_thread_id not in self._history_syncing_thread_ids
+            ):
                 for chat_id in self.bindings.chats_for_codex_thread(
                     binding.codex_thread_id
                 ):
@@ -1219,6 +1345,7 @@ class DiscordCodexGateway:
             self._deferred_started_threads.pop(thread_id, None)
             await self._cancel_provisional_thread(thread_id)
             self.active_turns.pop(thread_id, None)
+            await self._update_bound_task_status(thread_id)
             return
         if thread_id in self._history_syncing_thread_ids:
             self._queued_history_notifications.setdefault(thread_id, []).append(
@@ -1236,6 +1363,7 @@ class DiscordCodexGateway:
             turn_id = str(turn.get("id") or "")
             if turn_id:
                 self.active_turns[thread_id] = turn_id
+                await self._update_bound_task_status(thread_id)
                 for chat_id in chat_ids:
                     await self._show_turn_started(chat_id, turn_id)
             return
@@ -1244,6 +1372,7 @@ class DiscordCodexGateway:
             turn_id = str(turn.get("id") or "")
             if self.active_turns.get(thread_id) == turn_id:
                 self.active_turns.pop(thread_id, None)
+            await self._update_bound_task_status(thread_id)
             for chat_id in chat_ids:
                 await self._show_turn_completed(chat_id, turn)
             return
@@ -1377,7 +1506,7 @@ class DiscordCodexGateway:
         try:
             while True:
                 try:
-                    await self._resume_binding(provisional)
+                    resume_result = await self._resume_binding(provisional)
                 except CodexRpcError as error:
                     if not _is_missing_rollout_error(error, thread_id):
                         raise
@@ -1394,7 +1523,34 @@ class DiscordCodexGateway:
                     )
                     continue
                 self._awaiting_rollout_thread_ids.discard(thread_id)
-                binding = await self._create_discord_thread_for_task(thread)
+                resumed_thread = (
+                    resume_result.get("thread", {})
+                    if isinstance(resume_result, dict)
+                    else {}
+                )
+                # Resume metadata reflects the durable rollout; the start event
+                # supplies only fields omitted from the resume response.
+                synchronized_thread = dict(thread)
+                if isinstance(resumed_thread, dict):
+                    for field_name in ("name", "preview"):
+                        if field_name in resumed_thread:
+                            synchronized_thread[field_name] = resumed_thread.get(
+                                field_name
+                            )
+                synchronized_thread["id"] = thread_id
+                synchronized_thread["cwd"] = str(
+                    resume_result.get("cwd")
+                    or (
+                        resumed_thread.get("cwd")
+                        if isinstance(resumed_thread, dict)
+                        else ""
+                    )
+                    or thread.get("cwd")
+                    or self.settings.default_cwd
+                )
+                binding = await self._create_discord_thread_for_task(
+                    synchronized_thread
+                )
                 if binding is not None:
                     await self._sync_task_history(binding)
                     logger.info(
@@ -1471,9 +1627,16 @@ class DiscordCodexGateway:
             )
             return None
         title = self._task_title(thread)
+        cwd = str(thread.get("cwd") or self.settings.default_cwd)
+        discord_title = _discord_thread_title(
+            title,
+            cwd,
+            thread_id,
+            working=thread_id in self.active_turns,
+        )
         discord_chat_id = await self.adapter.create_codex_task_thread(
             parent_chat_id,
-            title,
+            discord_title,
             member_user_ids=self.settings.member_user_ids,
         )
         if not discord_chat_id:
@@ -1482,8 +1645,9 @@ class DiscordCodexGateway:
         binding = CodexTaskBinding(
             discord_chat_id=str(discord_chat_id),
             codex_thread_id=thread_id,
-            cwd=str(thread.get("cwd") or self.settings.default_cwd),
+            cwd=cwd,
             title=title,
+            discord_title=discord_title,
             parent_chat_id=parent_chat_id,
         )
         self.bindings.bind(binding)
@@ -1501,8 +1665,26 @@ class DiscordCodexGateway:
         if title:
             await self._rename_bound_task(thread_id, title)
 
-    async def _rename_bound_task(self, thread_id: str, title: str) -> None:
-        """Keep mapped Discord thread names aligned with the Codex task title."""
+    async def _update_bound_task_status(self, thread_id: str) -> None:
+        """Render one task's active or idle status in its Discord title."""
+        chat_ids = self.bindings.chats_for_codex_thread(thread_id)
+        if not chat_ids:
+            return
+        binding = self.bindings.bindings.get(chat_ids[0])
+        if binding is not None:
+            await self._rename_bound_task(
+                thread_id,
+                binding.title or "Codex task",
+            )
+
+    async def _rename_bound_task(
+        self,
+        thread_id: str,
+        title: str,
+        *,
+        cwd: Optional[str] = None,
+    ) -> None:
+        """Render Codex metadata into mapped Discord thread titles."""
         cleaned_title = re.sub(r"\s+", " ", title).strip()[:80]
         if not cleaned_title:
             return
@@ -1510,14 +1692,30 @@ class DiscordCodexGateway:
             binding = self.bindings.bindings.get(chat_id)
             if binding is None:
                 continue
+            expected_discord_title = (
+                binding.discord_title or (binding.title or "Codex task").strip()[:80]
+            )
+            desired_discord_title = _discord_thread_title(
+                cleaned_title,
+                cwd or binding.cwd,
+                binding.codex_thread_id,
+                working=thread_id in self.active_turns,
+            )
+            if desired_discord_title == expected_discord_title:
+                binding.title = cleaned_title
+                binding.discord_title = expected_discord_title
+                self.bindings.bind(binding)
+                continue
             renamed = await self.adapter.rename_thread(
                 chat_id,
-                cleaned_title,
-                only_if_current_name=binding.title[:80],
+                desired_discord_title,
+                only_if_current_name=expected_discord_title,
             )
-            if renamed:
-                binding.title = cleaned_title
-                self.bindings.bind(binding)
+            binding.title = cleaned_title
+            binding.discord_title = (
+                desired_discord_title if renamed else expected_discord_title
+            )
+            self.bindings.bind(binding)
 
     async def handle_server_request(
         self, request_id: Any, method: str, params: dict[str, Any]
