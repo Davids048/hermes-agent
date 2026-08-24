@@ -44,6 +44,7 @@ class FakeDiscordAdapter:
         self.create_task_thread_started_event: asyncio.Event | None = None
         self.create_task_thread_wait_event: asyncio.Event | None = None
         self.renamed_threads: list[tuple[str, str, str | None]] = []
+        self.rename_thread_wait_event: asyncio.Event | None = None
         self.rename_thread_result = True
         self.chat_names: dict[str, str] = {
             "discord-thread": "test Discord thread"
@@ -107,6 +108,8 @@ class FakeDiscordAdapter:
     ) -> bool:
         """Record one Codex-driven Discord thread rename."""
         self.renamed_threads.append((thread_id, name, only_if_current_name))
+        if self.rename_thread_wait_event is not None:
+            await self.rename_thread_wait_event.wait()
         return self.rename_thread_result
 
     async def get_chat_info(self, chat_id: str) -> dict[str, str]:
@@ -460,6 +463,43 @@ async def test_first_message_creates_codex_task_and_starts_turn(
     turn_params = gateway.client.requests[-1][1]
     assert turn_params["input"] == [{"type": "text", "text": "inspect the repository"}]
     assert turn_params["clientUserMessageId"] == "discord-message"
+
+
+@pytest.mark.asyncio
+async def test_send_event_to_codex_thread_rename_timeout_does_not_block_submission(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited title update cannot hold Discord message cleanup open."""
+    idle_title = "✅ Task name | tmp/project"
+    working_title = "⏳ Task name | tmp/project"
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-thread",
+            "codex-thread",
+            "/tmp/project",
+            title="Task name",
+            discord_title=idle_title,
+        )
+    )
+    gateway.adapter.rename_thread_wait_event = asyncio.Event()
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._DISCORD_THREAD_RENAME_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    response = await asyncio.wait_for(
+        gateway.handle_message(FakeMessageEvent("continue the task")),
+        timeout=0.2,
+    )
+
+    assert response == ""
+    assert gateway.client.requests[-1][0] == "turn/start"
+    assert gateway.active_turns["codex-thread"] == "turn-created"
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", working_title, idle_title)
+    ]
+    assert gateway.bindings.bindings["discord-thread"].discord_title == idle_title
 
 
 @pytest.mark.asyncio

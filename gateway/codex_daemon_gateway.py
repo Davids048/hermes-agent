@@ -37,6 +37,7 @@ _STREAM_EDIT_INTERVAL_SECONDS = 0.75
 _HISTORY_PAGE_SIZE = 100
 _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS = 80
 _DISCORD_THREAD_TITLE_SEPARATOR = " | "
+_DISCORD_THREAD_RENAME_TIMEOUT_SECONDS = 2.0
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -1813,11 +1814,23 @@ class DiscordCodexGateway:
                 binding.discord_title = expected_discord_title
                 self.bindings.bind(binding)
                 continue
-            renamed = await self.adapter.rename_thread(
-                chat_id,
-                desired_discord_title,
-                only_if_current_name=expected_discord_title,
-            )
+            try:
+                renamed = await asyncio.wait_for(
+                    self.adapter.rename_thread(
+                        chat_id,
+                        desired_discord_title,
+                        only_if_current_name=expected_discord_title,
+                    ),
+                    timeout=_DISCORD_THREAD_RENAME_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Discord thread rename timed out after %.1fs for %s; "
+                    "continuing without the title update",
+                    _DISCORD_THREAD_RENAME_TIMEOUT_SECONDS,
+                    chat_id,
+                )
+                renamed = False
             binding.title = cleaned_title
             binding.discord_title = (
                 desired_discord_title if renamed else expected_discord_title
