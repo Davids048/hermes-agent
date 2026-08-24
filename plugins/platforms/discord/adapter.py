@@ -39,6 +39,7 @@ from agent.display import ToolPreview
 logger = logging.getLogger(__name__)
 
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
+_DISCORD_LITERAL_METADATA_RE = re.compile(r"([\\`*_~|\[\]<>])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 _DISCORD_FENCED_CODE_BLOCK_RE = re.compile(
     r"^(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)(?P=fence)[ \t]*$",
@@ -7852,9 +7853,11 @@ class DiscordAdapter(BasePlatformAdapter):
         parent_chat_id: str,
         name: str,
         *,
+        task_title: str,
+        directory: str,
         member_user_ids: tuple[str, ...] = (),
     ) -> Optional[str]:
-        """Create and track a Discord thread that mirrors one Codex task."""
+        """Post a visible Codex task marker and create its tracked thread."""
         if not self._client or not DISCORD_AVAILABLE:
             return None
         try:
@@ -7873,32 +7876,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 exc,
             )
             return None
-        if isinstance(parent, getattr(discord, "DMChannel", ())):
+        if not isinstance(parent, getattr(discord, "TextChannel", ())):
+            logger.warning(
+                "[%s] Codex task thread: parent %s is not a Discord text channel",
+                self.name,
+                parent_chat_id,
+            )
             return None
         thread_name = (name or "Codex task").strip()[:80] or "Codex task"
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason="Codex task created by another client",
-                )
-                thread_id = str(thread.id)
-                await self._add_codex_task_thread_members(thread, member_user_ids)
-                self._threads.mark(thread_id)
-                return thread_id
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Codex task thread: direct create failed (%s); trying seed fallback",
-                self.name,
-                direct_error,
-            )
         try:
             send = getattr(parent, "send", None)
             if send is None:
                 return None
-            seed_message = await send(f"🧵 Codex task: **{thread_name}**")
+            seed_message = await send(
+                self._codex_task_starter_message(task_title, directory),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             thread = await seed_message.create_thread(
                 name=thread_name,
                 auto_archive_duration=1440,
@@ -7908,14 +7901,37 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._add_codex_task_thread_members(thread, member_user_ids)
             self._threads.mark(thread_id)
             return thread_id
-        except Exception as fallback_error:
+        except Exception as exc:
             logger.warning(
-                "[%s] Codex task thread: both create paths failed for parent %s: %s",
+                "[%s] Codex task thread: message-based creation failed for parent %s: %s",
                 self.name,
                 parent_chat_id,
-                fallback_error,
+                exc,
             )
             return None
+
+    def _codex_task_starter_message(self, task_title: str, directory: str) -> str:
+        """Render bounded plain text for a parent-channel Codex task marker."""
+        title_prefix = "🧵 Codex task: "
+        directory_prefix = "\n📁 Directory: "
+        title = re.sub(r"\s+", " ", str(task_title or "Untitled task")).strip()
+        directory = re.sub(r"\s+", " ", str(directory or ".")).strip()
+        title = self._escape_codex_task_metadata(title or "Untitled task")
+        directory = self._escape_codex_task_metadata(directory or ".")
+        directory_budget = self.MAX_MESSAGE_LENGTH - len(title_prefix + directory_prefix) - 1
+        directory = directory[:directory_budget]
+        title_budget = self.MAX_MESSAGE_LENGTH - len(title_prefix + directory_prefix + directory)
+        return f"{title_prefix}{title[:title_budget]}{directory_prefix}{directory}"
+
+    @staticmethod
+    def _escape_codex_task_metadata(text: str) -> str:
+        """Escape Discord formatting and mention tokens in task metadata."""
+        escaped = _DISCORD_LITERAL_METADATA_RE.sub(r"\\\1", text)
+        return re.sub(
+            r"@(?=everyone\b|here\b|[!&]?\d{17,20}\b)",
+            "@\u200b",
+            escaped,
+        )
 
     async def _add_codex_task_thread_members(
         self, thread: Any, member_user_ids: tuple[str, ...]

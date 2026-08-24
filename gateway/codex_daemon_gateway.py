@@ -89,6 +89,17 @@ def _parent_and_working_directory(cwd: str) -> str:
     return "/".join(parts[-2:])
 
 
+def _discord_thread_directory(cwd: str) -> str:
+    """Render the compact directory component used in a Discord task title."""
+    directory = re.sub(
+        r"\s+", " ", _parent_and_working_directory(cwd)
+    ).strip()
+    status_units = max(utf16_len("✅ "), utf16_len("⏳ "))
+    fixed_units = status_units + utf16_len(_DISCORD_THREAD_TITLE_SEPARATOR)
+    directory_budget = _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS - fixed_units - 2
+    return _truncate_utf16_suffix(directory, directory_budget)
+
+
 def _discord_thread_title(
     name: str,
     cwd: str,
@@ -98,15 +109,8 @@ def _discord_thread_title(
     """Render a status-prefixed task name and directory for Discord."""
     cleaned_name = re.sub(r"\s+", " ", str(name or "Untitled task")).strip()
     cleaned_name = cleaned_name or "Untitled task"
-    directory = re.sub(
-        r"\s+", " ", _parent_and_working_directory(cwd)
-    ).strip()
+    directory = _discord_thread_directory(cwd)
     status_prefix = "⏳ " if working else "✅ "
-    separator_units = utf16_len(_DISCORD_THREAD_TITLE_SEPARATOR)
-    fixed_units = utf16_len(status_prefix) + separator_units
-    # Reserve two UTF-16 units so any first Unicode code point can remain.
-    directory_budget = _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS - fixed_units - 2
-    directory = _truncate_utf16_suffix(directory, directory_budget)
     suffix = f"{_DISCORD_THREAD_TITLE_SEPARATOR}{directory}"
     name_budget = (
         _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS
@@ -1739,6 +1743,8 @@ class DiscordCodexGateway:
         discord_chat_id = await self.adapter.create_codex_task_thread(
             parent_chat_id,
             discord_title,
+            task_title=title,
+            directory=_discord_thread_directory(cwd),
             member_user_ids=self.settings.member_user_ids,
         )
         if not discord_chat_id:

@@ -40,6 +40,7 @@ class FakeDiscordAdapter:
         self.sent_metadata: list[dict[str, Any] | None] = []
         self.edited_metadata: list[dict[str, Any] | None] = []
         self.created_task_threads: list[tuple[str, str]] = []
+        self.created_task_starters: list[tuple[str, str]] = []
         self.create_task_thread_started_event: asyncio.Event | None = None
         self.create_task_thread_wait_event: asyncio.Event | None = None
         self.renamed_threads: list[tuple[str, str, str | None]] = []
@@ -83,6 +84,8 @@ class FakeDiscordAdapter:
         parent_chat_id: str,
         name: str,
         *,
+        task_title: str,
+        directory: str,
         member_user_ids: tuple[str, ...] = (),
     ) -> str:
         """Record one Discord thread created for an external Codex task."""
@@ -91,6 +94,7 @@ class FakeDiscordAdapter:
         if self.create_task_thread_wait_event is not None:
             await self.create_task_thread_wait_event.wait()
         self.created_task_threads.append((parent_chat_id, name))
+        self.created_task_starters.append((task_title, directory))
         self.created_task_thread_members = member_user_ids
         return f"discord-task-{len(self.created_task_threads)}"
 
@@ -512,6 +516,9 @@ async def test_external_started_task_creates_discord_thread_and_mapping(
             "✅ Mapped task | tmp/project",
         )
     ]
+    assert gateway.adapter.created_task_starters == [
+        ("Mapped task", "tmp/project")
+    ]
     assert gateway.adapter.created_task_thread_members == ("discord-user",)
     binding = gateway.bindings.bindings["discord-task-1"]
     assert binding.codex_thread_id == "external-thread"
@@ -563,6 +570,9 @@ async def test_external_started_task_uses_resumed_name_and_directory(
             "parent-channel",
             "⏳ Current task name | current/project",
         )
+    ]
+    assert gateway.adapter.created_task_starters == [
+        ("Current task name", "current/project")
     ]
     binding = gateway.bindings.bindings["discord-task-1"]
     assert binding.title == "Current task name"

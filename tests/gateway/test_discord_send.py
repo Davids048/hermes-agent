@@ -329,21 +329,33 @@ async def test_handle_codex_activity_interaction_waits_without_notification(
 
 
 @pytest.mark.asyncio
-async def test_create_codex_task_thread_uses_configured_parent(
+async def test_create_codex_task_thread_posts_visible_starter_message(
     monkeypatch, tmp_path
 ):
-    """A daemon task receives a tracked Discord thread under the home channel."""
+    """A daemon task thread starts from a visible parent-channel message."""
+    class FakeTextChannel:
+        """Represent a Discord text channel accepted by the adapter."""
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(
         discord_platform.discord,
         "Object",
         lambda *, id: SimpleNamespace(id=id),
     )
+    disabled_mentions = object()
+    monkeypatch.setattr(
+        discord_platform.discord,
+        "AllowedMentions",
+        SimpleNamespace(none=lambda: disabled_mentions),
+    )
+    monkeypatch.setattr(discord_platform.discord, "TextChannel", FakeTextChannel)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     created_thread = SimpleNamespace(id=777, add_user=AsyncMock())
-    parent = SimpleNamespace(
+    seed_message = SimpleNamespace(
         create_thread=AsyncMock(return_value=created_thread),
     )
+    parent = FakeTextChannel()
+    parent.send = AsyncMock(return_value=seed_message)
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: parent,
         fetch_channel=AsyncMock(),
@@ -352,18 +364,92 @@ async def test_create_codex_task_thread_uses_configured_parent(
     thread_id = await adapter.create_codex_task_thread(
         "555",
         "Terminal task",
+        task_title="Inspect the repository",
+        directory="codes/hermes-agent",
         member_user_ids=("123",),
     )
 
     assert thread_id == "777"
     assert "777" in adapter._threads
-    parent.create_thread.assert_awaited_once_with(
+    parent.send.assert_awaited_once()
+    send_args = parent.send.await_args
+    assert send_args.args == (
+        "🧵 Codex task: Inspect the repository\n"
+        "📁 Directory: codes/hermes-agent",
+    )
+    assert send_args.kwargs["allowed_mentions"] is disabled_mentions
+    seed_message.create_thread.assert_awaited_once_with(
         name="Terminal task",
         auto_archive_duration=1440,
         reason="Codex task created by another client",
     )
     created_thread.add_user.assert_awaited_once()
     assert created_thread.add_user.await_args.args[0].id == 123
+
+
+def test_codex_task_starter_message_normalizes_and_bounds_metadata(
+    monkeypatch, tmp_path
+):
+    """The visible marker fits Discord after normalizing task metadata."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    content = adapter._codex_task_starter_message(
+        "Inspect\n" + "x" * 2500,
+        "codes /  hermes-agent",
+    )
+
+    assert len(content) == adapter.MAX_MESSAGE_LENGTH
+    assert content.startswith("🧵 Codex task: Inspect x")
+    assert content.endswith("\n📁 Directory: codes / hermes-agent")
+
+
+def test_codex_task_starter_message_escapes_discord_syntax(
+    monkeypatch, tmp_path
+):
+    """Task metadata displays literally without formatting or live mentions."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    content = adapter._codex_task_starter_message(
+        "**Review** <@12345678901234567> `<#12345678901234567>`",
+        "codes/a_b",
+    )
+
+    assert content == (
+        "🧵 Codex task: \\*\\*Review\\*\\* "
+        "\\<@\u200b12345678901234567\\> "
+        "\\`\\<#12345678901234567\\>\\`\n"
+        "📁 Directory: codes/a\\_b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_codex_task_thread_rejects_non_text_parent(
+    monkeypatch, tmp_path
+):
+    """An unsupported parent cannot receive an orphan Codex task marker."""
+    class FakeTextChannel:
+        """Represent the only parent type that can own a message thread."""
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(discord_platform.discord, "TextChannel", FakeTextChannel)
+    parent = SimpleNamespace(send=AsyncMock())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    thread_id = await adapter.create_codex_task_thread(
+        "555",
+        "Terminal task",
+        task_title="Inspect the repository",
+        directory="codes/hermes-agent",
+    )
+
+    assert thread_id is None
+    parent.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
