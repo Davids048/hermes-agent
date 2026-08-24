@@ -663,6 +663,15 @@ class DiscordTurnDisplay:
     rendered_on_connection: bool = False
 
 
+@dataclass(frozen=True)
+class QueuedCodexNotification:
+    """One notification deferred until durable transcript replay finishes."""
+
+    method: str
+    params: dict[str, Any]
+    finalize_turn_activity: bool = False
+
+
 class DiscordCodexGateway:
     """Translate Discord input and Codex events without invoking Hermes AIAgent."""
 
@@ -695,7 +704,7 @@ class DiscordCodexGateway:
         self._awaiting_rollout_thread_ids: set[str] = set()
         self._history_syncing_thread_ids: set[str] = set()
         self._queued_history_notifications: dict[
-            str, list[tuple[str, dict[str, Any]]]
+            str, list[QueuedCodexNotification]
         ] = {}
         self.client = client or CodexDaemonClient(
             settings.socket_path,
@@ -1000,12 +1009,12 @@ class DiscordCodexGateway:
         )
 
     async def _refresh_task(self, chat_id: str) -> str:
-        """Resubscribe one mapped task and replay its missing durable history."""
+        """Resubscribe one mapped task and apply its current status."""
         binding = self.bindings.bindings.get(chat_id)
         if binding is None:
             return "This Discord thread is not attached to a Codex task."
         try:
-            result = await self._resume_and_sync_binding(binding)
+            result = await self._resume_binding(binding)
         except CodexRpcError as error:
             if _is_missing_rollout_error(error, binding.codex_thread_id):
                 return (
@@ -1121,18 +1130,45 @@ class DiscordCodexGateway:
         await self._clear_socket_scoped_state()
         self.active_turns.clear()
         bindings = list(self.bindings.bindings.values())
-        self._history_syncing_thread_ids.update(
-            binding.codex_thread_id for binding in bindings
-        )
+        resumed_bindings: list[tuple[CodexTaskBinding, dict[str, Any]]] = []
+
+        # Subscribe every mapped task before any long transcript replay begins.
         for binding in bindings:
             try:
-                result = await self._resume_and_sync_binding(binding)
+                result = await self._resume_binding(binding, show_activity=False)
+                resumed_bindings.append((binding, result))
+            except Exception:
+                logger.exception(
+                    "Could not subscribe to mapped Codex task %s",
+                    binding.codex_thread_id,
+                )
+
+        for binding, result in resumed_bindings:
+            try:
                 await self._synchronize_binding_metadata(binding, result)
             except Exception:
                 logger.exception(
-                    "Could not synchronize mapped Codex task %s",
+                    "Could not synchronize mapped Codex task metadata %s",
                     binding.codex_thread_id,
                 )
+
+        for binding, _ in resumed_bindings:
+            self._history_syncing_thread_ids.add(binding.codex_thread_id)
+            try:
+                await self._sync_task_history(binding)
+            except Exception:
+                logger.exception(
+                    "Could not synchronize mapped Codex task history %s",
+                    binding.codex_thread_id,
+                )
+            finally:
+                try:
+                    await self._finish_history_sync(binding.codex_thread_id)
+                except Exception:
+                    logger.exception(
+                        "Could not finish mapped Codex task history %s",
+                        binding.codex_thread_id,
+                    )
         await self._discover_loaded_tasks()
 
     async def _discover_loaded_tasks(self) -> None:
@@ -1254,14 +1290,43 @@ class DiscordCodexGateway:
 
     async def _finish_history_sync(self, thread_id: str) -> None:
         """Resume live rendering after one task's durable history is synchronized."""
-        self._history_syncing_thread_ids.discard(thread_id)
-        active_turn_id = self.active_turns.get(thread_id)
-        if active_turn_id:
-            for chat_id in self.bindings.chats_for_codex_thread(thread_id):
-                await self._show_turn_started(chat_id, active_turn_id)
-        notifications = self._queued_history_notifications.pop(thread_id, [])
-        for method, params in notifications:
-            await self.handle_notification(method, params)
+        completed_turns: list[dict[str, Any]] = []
+        try:
+            # Keep the barrier active so completions received during replay join the queue.
+            while True:
+                notifications = self._queued_history_notifications.pop(thread_id, [])
+                if not notifications:
+                    self._history_syncing_thread_ids.discard(thread_id)
+                    break
+                for index, notification in enumerate(notifications):
+                    if notification.finalize_turn_activity:
+                        completed_turns.append(notification.params.get("turn") or {})
+                        continue
+                    try:
+                        await self.handle_notification(
+                            notification.method,
+                            notification.params,
+                            defer_during_history_sync=False,
+                        )
+                    except BaseException:
+                        # Preserve the failed suffix so a later refresh can retry it.
+                        newer_notifications = self._queued_history_notifications.pop(
+                            thread_id, []
+                        )
+                        self._queued_history_notifications[thread_id] = [
+                            *notifications[index:],
+                            *newer_notifications,
+                        ]
+                        raise
+            active_turn_id = self.active_turns.get(thread_id)
+            if active_turn_id:
+                for chat_id in self.bindings.chats_for_codex_thread(thread_id):
+                    await self._show_turn_started(chat_id, active_turn_id)
+            for turn in completed_turns:
+                for chat_id in self.bindings.chats_for_codex_thread(thread_id):
+                    await self._show_turn_completed(chat_id, turn)
+        finally:
+            self._history_syncing_thread_ids.discard(thread_id)
 
     async def _register_history_turn_activity(
         self, chat_id: str, turn_id: str, *, status: str
@@ -1336,7 +1401,11 @@ class DiscordCodexGateway:
         return None
 
     async def handle_notification(
-        self, method: str, params: dict[str, Any]
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        defer_during_history_sync: bool = True,
     ) -> None:
         """Mirror live Codex lifecycle and item notifications into Discord."""
         if method == "serverRequest/resolved":
@@ -1358,12 +1427,13 @@ class DiscordCodexGateway:
             self.active_turns.pop(thread_id, None)
             await self._update_bound_task_status(thread_id)
             return
-        if thread_id in self._history_syncing_thread_ids:
+        history_syncing = thread_id in self._history_syncing_thread_ids
+        chat_ids = self.bindings.chats_for_codex_thread(thread_id)
+        if history_syncing and not chat_ids and defer_during_history_sync:
             self._queued_history_notifications.setdefault(thread_id, []).append(
-                (method, params)
+                QueuedCodexNotification(method, params)
             )
             return
-        chat_ids = self.bindings.chats_for_codex_thread(thread_id)
         if not chat_ids:
             return
         if method == "thread/name/updated":
@@ -1375,18 +1445,41 @@ class DiscordCodexGateway:
             if turn_id:
                 self.active_turns[thread_id] = turn_id
                 await self._update_bound_task_status(thread_id)
-                for chat_id in chat_ids:
-                    await self._show_turn_started(chat_id, turn_id)
+                if not history_syncing:
+                    for chat_id in chat_ids:
+                        await self._show_turn_started(chat_id, turn_id)
             return
         if method == "turn/completed":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id") or "")
             if self.active_turns.get(thread_id) == turn_id:
                 self.active_turns.pop(thread_id, None)
+            defer_turn_activity = history_syncing and defer_during_history_sync
+            if defer_turn_activity:
+                self._queued_history_notifications.setdefault(thread_id, []).append(
+                    QueuedCodexNotification(
+                        method,
+                        params,
+                        finalize_turn_activity=True,
+                    )
+                )
             await self._update_bound_task_status(thread_id)
+            if defer_turn_activity:
+                return
             for chat_id in chat_ids:
                 await self._show_turn_completed(chat_id, turn)
             return
+        if method == "item/completed":
+            item = params.get("item") or {}
+            if (
+                history_syncing
+                and defer_during_history_sync
+                and item.get("type") != "userMessage"
+            ):
+                self._queued_history_notifications.setdefault(thread_id, []).append(
+                    QueuedCodexNotification(method, params)
+                )
+                return
         if method in {"item/agentMessage/delta", "item/plan/delta"}:
             item_id = str(params.get("itemId") or "")
             prefix = "**Plan**\n" if method == "item/plan/delta" else ""
@@ -1451,7 +1544,6 @@ class DiscordCodexGateway:
                 await self._show_item(chat_id, params, item, final=False)
             return
         if method == "item/completed":
-            item = params.get("item") or {}
             if item.get("type") == "userMessage":
                 await self._rename_untitled_task(
                     thread_id, self._user_message_text(item)
@@ -2485,7 +2577,7 @@ class DiscordCodexGateway:
             "- `/resume TASK_ID-or-title` — search for and attach a task\n"
             "- `/new [/absolute/cwd]` — attach a fresh task\n"
             "- `/status` — show the attached task and live turn\n"
-            "- `/refresh` — resubscribe and replay missing task history\n"
+            "- `/refresh` — reread task status and metadata\n"
             "- `/stop` — interrupt the active Codex turn\n"
             "- `/approve`, `/approve session`, `/deny` — answer approvals\n\n"
             "A normal message starts or steers the attached Codex task. "

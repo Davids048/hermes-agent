@@ -1099,6 +1099,203 @@ async def test_resume_bound_tasks_replays_notification_after_history(
 
 
 @pytest.mark.asyncio
+async def test_resume_bound_tasks_keeps_other_task_notifications_live(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Synchronizing one task does not defer another mapped task's output."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-first", "codex-first", "/tmp/first")
+    )
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-second", "codex-second", "/tmp/second")
+    )
+    delivered = False
+
+    async def deliver_other_task_item() -> None:
+        """Inject output for the task that is not synchronizing history."""
+        nonlocal delivered
+        if delivered:
+            return
+        delivered = True
+        await gateway.handle_notification(
+            "item/completed",
+            {
+                "threadId": "codex-second",
+                "turnId": "live-turn",
+                "item": {
+                    "id": "live-response",
+                    "type": "agentMessage",
+                    "text": "live response",
+                },
+            },
+        )
+        assert gateway.adapter.sent == [("discord-second", "live response")]
+
+    gateway.client.history_list_callback = deliver_other_task_item
+
+    await gateway._resume_bound_tasks()
+
+    assert gateway.adapter.sent == [("discord-second", "live response")]
+
+
+@pytest.mark.asyncio
+async def test_resume_bound_tasks_subscribes_every_task_before_history_replay(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Startup subscribes and refreshes every title before replaying history."""
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-first",
+            "codex-first",
+            "/tmp/first",
+            title="First task",
+            discord_title="⏳ First task | tmp/first",
+        )
+    )
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-second",
+            "codex-second",
+            "/tmp/second",
+            title="Second task",
+            discord_title="⏳ Second task | tmp/second",
+        )
+    )
+    checked_first_history_request = False
+
+    async def verify_subscriptions_and_titles() -> None:
+        """Check startup phase ordering when the first history request begins."""
+        nonlocal checked_first_history_request
+        if checked_first_history_request:
+            return
+        checked_first_history_request = True
+        resumed_thread_ids = [
+            params["threadId"]
+            for method, params in gateway.client.requests
+            if method == "thread/resume"
+        ]
+        assert resumed_thread_ids == ["codex-first", "codex-second"]
+        assert gateway.bindings.bindings["discord-second"].discord_title == (
+            "✅ Mapped task | tmp/project"
+        )
+
+    gateway.client.history_list_callback = verify_subscriptions_and_titles
+
+    await gateway._resume_bound_tasks()
+
+    assert checked_first_history_request is True
+
+
+@pytest.mark.asyncio
+async def test_finish_history_sync_drains_new_completions_in_order(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completion received during queue replay follows earlier output."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway._history_syncing_thread_ids.add("codex-thread")
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": "first response",
+            },
+        },
+    )
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+    original_send = gateway.adapter.send
+
+    async def block_first_send(
+        chat_id: str,
+        content: str,
+        **kwargs: Any,
+    ) -> FakeSendResult:
+        """Pause the first queued delivery while a newer event arrives."""
+        if content == "first response":
+            first_send_started.set()
+            await release_first_send.wait()
+        return await original_send(chat_id, content, **kwargs)
+
+    monkeypatch.setattr(gateway.adapter, "send", block_first_send)
+    finish_task = asyncio.create_task(gateway._finish_history_sync("codex-thread"))
+    await asyncio.wait_for(first_send_started.wait(), timeout=1)
+
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-2",
+            "item": {
+                "id": "agent-2",
+                "type": "agentMessage",
+                "text": "second response",
+            },
+        },
+    )
+    release_first_send.set()
+    await asyncio.wait_for(finish_task, timeout=1)
+
+    assert gateway.adapter.sent == [
+        ("discord-thread", "first response"),
+        ("discord-thread", "second response"),
+    ]
+    assert "codex-thread" not in gateway._history_syncing_thread_ids
+    assert "codex-thread" not in gateway._queued_history_notifications
+
+
+@pytest.mark.asyncio
+async def test_finish_history_sync_preserves_failed_completion_for_later_sync(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed queued delivery remains retryable by later synchronization."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway._history_syncing_thread_ids.add("codex-thread")
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": "retryable response",
+            },
+        },
+    )
+    original_send = gateway.adapter.send
+
+    async def fail_send(*args: Any, **kwargs: Any) -> FakeSendResult:
+        """Fail the first attempt to deliver the queued completion."""
+        raise RuntimeError("Discord delivery failed")
+
+    monkeypatch.setattr(gateway.adapter, "send", fail_send)
+
+    with pytest.raises(RuntimeError, match="Discord delivery failed"):
+        await gateway._finish_history_sync("codex-thread")
+
+    assert "codex-thread" not in gateway._history_syncing_thread_ids
+    queued = gateway._queued_history_notifications["codex-thread"]
+    assert [notification.method for notification in queued] == ["item/completed"]
+
+    monkeypatch.setattr(gateway.adapter, "send", original_send)
+    gateway._history_syncing_thread_ids.add("codex-thread")
+    await gateway._finish_history_sync("codex-thread")
+
+    assert gateway.adapter.sent == [("discord-thread", "retryable response")]
+    assert "codex-thread" not in gateway._queued_history_notifications
+
+
+@pytest.mark.asyncio
 async def test_reconnect_preserves_discord_prompt_identity(
     gateway: DiscordCodexGateway,
 ) -> None:
@@ -1269,6 +1466,180 @@ async def test_turn_lifecycle_updates_discord_title_status(
         ("discord-thread", idle_title, working_title),
     ]
     assert gateway.bindings.bindings["discord-thread"].discord_title == idle_title
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_updates_title_during_history_sync(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Live lifecycle events update the task title during transcript replay."""
+    idle_title = "✅ Task name | tmp/project"
+    working_title = "⏳ Task name | tmp/project"
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-thread",
+            "codex-thread",
+            "/tmp/project",
+            title="Task name",
+            discord_title=idle_title,
+        )
+    )
+    gateway._history_syncing_thread_ids.add("codex-thread")
+
+    await gateway.handle_notification(
+        "turn/started",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "inProgress"},
+        },
+    )
+
+    assert gateway.active_turns == {"codex-thread": "turn-1"}
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", working_title, idle_title)
+    ]
+
+    await gateway.handle_notification(
+        "turn/completed",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "completed"},
+        },
+    )
+
+    assert gateway.active_turns == {}
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", working_title, idle_title),
+        ("discord-thread", idle_title, working_title),
+    ]
+    queued = gateway._queued_history_notifications["codex-thread"]
+    assert len(queued) == 1
+    assert queued[0].method == "turn/completed"
+    assert queued[0].finalize_turn_activity is True
+
+    await gateway._finish_history_sync("codex-thread")
+
+    assert len(gateway.adapter.renamed_threads) == 2
+    assert "codex-thread" not in gateway._queued_history_notifications
+
+
+@pytest.mark.asyncio
+async def test_agent_message_streams_during_history_sync(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mapped task streams live text while durable history is replayed."""
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._STREAM_EDIT_INTERVAL_SECONDS", 0
+    )
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway._history_syncing_thread_ids.add("codex-thread")
+
+    await gateway.handle_notification(
+        "item/agentMessage/delta",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "itemId": "agent-1",
+            "delta": "live text",
+        },
+    )
+    await gateway.stream_messages[("discord-thread", "agent-1")].flush_task
+
+    assert gateway.adapter.sent == [("discord-thread", "live text")]
+    assert gateway._queued_history_notifications == {}
+
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": "complete text",
+            },
+        },
+    )
+
+    assert gateway.adapter.edited == []
+    assert gateway._queued_history_notifications["codex-thread"][0].method == (
+        "item/completed"
+    )
+
+    await gateway._finish_history_sync("codex-thread")
+
+    assert gateway.adapter.edited == [
+        ("discord-thread", "1", "complete text", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_prompt_precedes_agent_stream_during_history_sync(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal prompt reaches Discord before its same-turn agent stream."""
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._STREAM_EDIT_INTERVAL_SECONDS", 0
+    )
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway._history_syncing_thread_ids.add("codex-thread")
+
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "user-1",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "terminal prompt"}],
+            },
+        },
+    )
+    await gateway.handle_notification(
+        "item/agentMessage/delta",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "itemId": "agent-1",
+            "delta": "partial answer",
+        },
+    )
+    await gateway.stream_messages[("discord-thread", "agent-1")].flush_task
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": "complete answer",
+            },
+        },
+    )
+
+    assert gateway.adapter.sent == [
+        ("discord-thread", "terminal prompt"),
+        ("discord-thread", "partial answer"),
+    ]
+    assert gateway.adapter.edited == []
+
+    await gateway._finish_history_sync("codex-thread")
+
+    assert gateway.adapter.sent == [
+        ("discord-thread", "terminal prompt"),
+        ("discord-thread", "partial answer"),
+    ]
+    assert gateway.adapter.edited == [
+        ("discord-thread", "2", "complete answer", True)
+    ]
 
 
 @pytest.mark.asyncio
@@ -2398,10 +2769,10 @@ async def test_refresh_task_migrates_contextual_discord_title_guard(
 
 
 @pytest.mark.asyncio
-async def test_refresh_replays_each_missing_history_item_once(
+async def test_refresh_task_skips_history_replay(
     gateway: DiscordCodexGateway,
 ) -> None:
-    """Repeated refreshes resubscribe without duplicating delivered history."""
+    """Refresh reads current status without reconstructing transcript messages."""
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -2430,7 +2801,10 @@ async def test_refresh_replays_each_missing_history_item_once(
     assert first_response.startswith("Refreshed Codex task `codex-thread`.")
     assert second_response.startswith("Refreshed Codex task `codex-thread`.")
     assert "State: idle" in second_response
-    assert gateway.adapter.sent == [("discord-thread", "Recovered response.")]
+    assert gateway.adapter.sent == []
+    assert all(
+        method != "thread/turns/list" for method, _ in gateway.client.requests
+    )
     assert gateway.bindings.bindings["discord-thread"].cwd == "/tmp/project"
     assert gateway.bindings.bindings["discord-thread"].title == "Mapped task"
     assert gateway.adapter.renamed_threads == [
