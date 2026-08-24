@@ -44,6 +44,10 @@ class FakeDiscordAdapter:
         self.create_task_thread_wait_event: asyncio.Event | None = None
         self.renamed_threads: list[tuple[str, str, str | None]] = []
         self.rename_thread_result = True
+        self.chat_names: dict[str, str] = {
+            "discord-thread": "test Discord thread"
+        }
+        self.thread_name_match_results: dict[tuple[str, str], bool] = {}
         self.registered_activities: list[tuple[str, str, str]] = []
 
     async def send(
@@ -100,6 +104,23 @@ class FakeDiscordAdapter:
         """Record one Codex-driven Discord thread rename."""
         self.renamed_threads.append((thread_id, name, only_if_current_name))
         return self.rename_thread_result
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, str]:
+        """Return the raw Discord name for one mapped test thread."""
+        return {
+            "name": self.chat_names.get(str(chat_id), str(chat_id)),
+            "type": "thread",
+        }
+
+    async def thread_name_matches(
+        self,
+        thread_id: str,
+        expected_name: str,
+    ) -> bool:
+        """Return the configured live-thread name comparison result."""
+        key = (str(thread_id), expected_name)
+        raw_name = self.chat_names.get(str(thread_id), str(thread_id))
+        return self.thread_name_match_results.get(key, raw_name == expected_name)
 
     def register_codex_activity(
         self,
@@ -445,6 +466,38 @@ async def test_first_message_creates_codex_task_and_starts_turn(
     turn_params = gateway.client.requests[-1][1]
     assert turn_params["input"] == [{"type": "text", "text": "inspect the repository"}]
     assert turn_params["clientUserMessageId"] == "discord-message"
+
+
+@pytest.mark.asyncio
+async def test_create_task_for_event_uses_raw_discord_name_guard(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Initial binding compares renames against the raw Discord thread name."""
+    event = FakeMessageEvent("inspect the repository")
+    event.source.chat_name = "Test server / #m7 / raw thread name"
+    event.source.auto_thread_initial_name = None
+    gateway.adapter.chat_names["discord-thread"] = "raw thread name"
+
+    await gateway.handle_message(event)
+
+    idle_title = _discord_thread_title(
+        "Test server / #m7 / raw thread name",
+        str(gateway.settings.default_cwd),
+        "thread-created",
+    )
+    working_title = _discord_thread_title(
+        "Test server / #m7 / raw thread name",
+        str(gateway.settings.default_cwd),
+        "thread-created",
+        working=True,
+    )
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", idle_title, "raw thread name"),
+        ("discord-thread", working_title, idle_title),
+    ]
+    binding = gateway.bindings.bindings["discord-thread"]
+    assert binding.title == "Test server / #m7 / raw thread name"
+    assert binding.discord_title == working_title
 
 
 @pytest.mark.asyncio
@@ -1453,11 +1506,39 @@ async def test_new_command_names_created_codex_task(
 
 
 @pytest.mark.asyncio
+async def test_new_from_command_uses_raw_discord_name_guard(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A first `/new` mapping separates semantic and raw Discord names."""
+    event = FakeMessageEvent("/new")
+    event.source.chat_name = "Test server / #m7 / raw thread name"
+    gateway.adapter.chat_names["discord-thread"] = "raw thread name"
+
+    await gateway.handle_message(event)
+
+    assert gateway.client.requests[-1] == (
+        "thread/name/set",
+        {
+            "threadId": "thread-created",
+            "name": "Test server / #m7 / raw thread name",
+        },
+    )
+    expected_title = _discord_thread_title(
+        "Test server / #m7 / raw thread name",
+        str(gateway.settings.default_cwd),
+        "thread-created",
+    )
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", expected_title, "raw thread name")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_new_command_reuses_semantic_name_from_rendered_discord_title(
     gateway: DiscordCodexGateway,
 ) -> None:
-    """Starting another task does not copy title metadata into the Codex name."""
-    previous_discord_title = "✅ Semantic task | tmp/previous | previous-thread"
+    """An unchanged contextual guard preserves the prior semantic task name."""
+    previous_discord_title = "Test server / #m7 / raw thread name"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1468,7 +1549,11 @@ async def test_new_command_reuses_semantic_name_from_rendered_discord_title(
         )
     )
     event = FakeMessageEvent("/new")
-    event.source.chat_name = previous_discord_title
+    event.source.chat_name = "Test server / #raw thread name"
+    gateway.adapter.chat_names["discord-thread"] = "raw thread name"
+    gateway.adapter.thread_name_match_results[
+        ("discord-thread", previous_discord_title)
+    ] = True
 
     await gateway.handle_message(event)
 
@@ -1484,6 +1569,9 @@ async def test_new_command_reuses_semantic_name_from_rendered_discord_title(
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", expected_title, previous_discord_title)
     ]
+    binding = gateway.bindings.bindings["discord-thread"]
+    assert binding.title == "Semantic task"
+    assert binding.discord_title == expected_title
 
 
 @pytest.mark.asyncio
@@ -1491,7 +1579,7 @@ async def test_new_command_uses_manual_discord_title_as_semantic_name(
     gateway: DiscordCodexGateway,
 ) -> None:
     """Starting another task carries a manual Discord name into Codex."""
-    previous_discord_title = "✅ Semantic task | tmp/previous | previous-thread"
+    previous_discord_title = "Test server / #m7 / raw thread name"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1503,7 +1591,11 @@ async def test_new_command_uses_manual_discord_title_as_semantic_name(
     )
     gateway.adapter.rename_thread_result = False
     event = FakeMessageEvent("/new")
-    event.source.chat_name = "Human title"
+    event.source.chat_name = "Test server / #Human title"
+    gateway.adapter.chat_names["discord-thread"] = "Human title"
+    gateway.adapter.thread_name_match_results[
+        ("discord-thread", previous_discord_title)
+    ] = False
 
     await gateway.handle_message(event)
 
@@ -2237,6 +2329,29 @@ async def test_resume_search_binds_unique_codex_task(
 
 
 @pytest.mark.asyncio
+async def test_resume_from_command_uses_raw_discord_name_guard(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A first `/resume` mapping guards against the raw Discord thread name."""
+    event = FakeMessageEvent("/resume Search result")
+    event.source.chat_name = "Test server / #m7 / raw thread name"
+    gateway.adapter.chat_names["discord-thread"] = "raw thread name"
+
+    await gateway.handle_message(event)
+
+    assert gateway.adapter.renamed_threads == [
+        (
+            "discord-thread",
+            (
+                "✅ Mapped task | tmp/project | "
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            "raw thread name",
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resume_from_command_uses_stored_discord_title_guard(
     gateway: DiscordCodexGateway,
 ) -> None:
@@ -2274,6 +2389,34 @@ async def test_resume_without_selector_lists_recent_codex_tasks(
 
     assert "Search result" in response
     assert gateway.client.requests[-1][0] == "thread/list"
+
+
+@pytest.mark.asyncio
+async def test_refresh_task_migrates_contextual_discord_title_guard(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Refresh replaces a context-qualified guard after a successful rename."""
+    contextual_guard = "Test server / #m7 / raw thread name"
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-thread",
+            "codex-thread",
+            "/tmp/original",
+            title="Previous task",
+            discord_title=contextual_guard,
+        )
+    )
+
+    response = await gateway.handle_message(FakeMessageEvent("/refresh"))
+
+    rendered_title = "✅ Mapped task | tmp/project | codex-thread"
+    assert response.startswith("Refreshed Codex task `codex-thread`.")
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", rendered_title, contextual_guard)
+    ]
+    assert gateway.bindings.bindings["discord-thread"].discord_title == (
+        rendered_title
+    )
 
 
 @pytest.mark.asyncio

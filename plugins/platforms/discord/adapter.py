@@ -7665,6 +7665,44 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return None
 
+    def _thread_name_guards(self, thread: Any) -> set[Optional[str]]:
+        """Return every name representation derived from one live thread."""
+        current_name = getattr(thread, "name", None)
+        contextual_names = {current_name, self._format_thread_chat_name(thread)}
+        parent = getattr(thread, "parent", None)
+        guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
+        guild_name = getattr(guild, "name", None)
+        if guild_name and current_name:
+            contextual_names.add(f"{guild_name} / #{current_name}")
+            contextual_names.add(f"{guild_name} / {current_name}")
+        return contextual_names
+
+    async def thread_name_matches(
+        self,
+        thread_id: str,
+        expected_name: str,
+    ) -> bool:
+        """Return whether a stored name still identifies the live thread."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            thread_id_int = int(str(thread_id))
+        except (TypeError, ValueError):
+            return False
+        try:
+            thread = self._client.get_channel(thread_id_int)
+            if thread is None:
+                thread = await self._client.fetch_channel(thread_id_int)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to resolve Discord thread %s for name comparison",
+                self.name,
+                thread_id,
+                exc_info=True,
+            )
+            return False
+        return expected_name in self._thread_name_guards(thread)
+
     async def rename_thread(
         self,
         thread_id: str,
@@ -7674,8 +7712,10 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> bool:
         """Best-effort Discord thread rename.
 
-        ``only_if_current_name`` prevents overwriting human-renamed or
-        pre-existing threads.  This is intentionally a no-op on mismatch.
+        ``only_if_current_name`` accepts the raw thread name or a contextual
+        name that this adapter derives from the same live thread. This is a
+        no-op when neither representation matches, which preserves human
+        renames.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return False
@@ -7703,7 +7743,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
-        if only_if_current_name is not None and current_name != only_if_current_name:
+        if (
+            only_if_current_name is not None
+            and only_if_current_name not in self._thread_name_guards(thread)
+        ):
             logger.info(
                 "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
                 self.name, thread_id, current_name, only_if_current_name,

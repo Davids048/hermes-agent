@@ -449,6 +449,73 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "contextual_guard",
+    [
+        "Test server / #m7 / raw thread name",
+        "Test server / #raw thread name",
+        "Test server / raw thread name",
+    ],
+)
+async def test_rename_thread_accepts_contextual_current_name(
+    adapter,
+    contextual_guard,
+):
+    """A context-qualified guard resolves to the same live Discord thread."""
+    guild = SimpleNamespace(name="Test server")
+    parent = SimpleNamespace(name="m7", guild=guild)
+    thread = SimpleNamespace(
+        id=999,
+        name="raw thread name",
+        guild=guild,
+        parent=parent,
+        edit=AsyncMock(),
+    )
+    adapter._client.get_channel = lambda _id: thread
+
+    matches = await adapter.thread_name_matches("999", contextual_guard)
+    result = await adapter.rename_thread(
+        "999",
+        "✅ Semantic title | codes/project | session-id",
+        only_if_current_name=contextual_guard,
+    )
+
+    assert matches is True
+    assert result is True
+    thread.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_rejects_stale_contextual_name(adapter):
+    """A human rename invalidates every context-qualified title guard."""
+    guild = SimpleNamespace(name="Test server")
+    parent = SimpleNamespace(name="m7", guild=guild)
+    thread = SimpleNamespace(
+        id=999,
+        name="human title",
+        guild=guild,
+        parent=parent,
+        edit=AsyncMock(),
+    )
+    adapter._client.get_channel = lambda _id: thread
+
+    matches = await adapter.thread_name_matches(
+        "999",
+        "Test server / raw thread name",
+    )
+
+    result = await adapter.rename_thread(
+        "999",
+        "✅ Semantic title | codes/project | session-id",
+        only_if_current_name="Test server / raw thread name",
+    )
+
+    assert matches is False
+    assert result is False
+    thread.edit.assert_not_awaited()
+
+
 # ------------------------------------------------------------------
 # Auto-thread integration in _handle_message
 # ------------------------------------------------------------------
@@ -600,5 +667,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
-

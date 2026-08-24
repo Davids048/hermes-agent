@@ -811,12 +811,13 @@ class DiscordCodexGateway:
             or getattr(source, "chat_name", None)
             or "Discord Codex task"
         )
+        discord_title = await self._raw_discord_thread_name(source)
         binding = CodexTaskBinding(
             discord_chat_id=str(source.chat_id),
             codex_thread_id=thread_id,
             cwd=str(result.get("cwd") or self.settings.default_cwd),
             title=title,
-            discord_title=title,
+            discord_title=discord_title,
             guild_id=getattr(source, "guild_id", None),
             parent_chat_id=getattr(source, "parent_chat_id", None),
         )
@@ -847,19 +848,30 @@ class DiscordCodexGateway:
         source_title = str(
             getattr(source, "chat_name", None) or "Discord Codex task"
         )
+        raw_discord_title = await self._raw_discord_thread_name(source)
         hermes_owned_title = (
             (previous_binding.discord_title or previous_binding.title)
             if previous_binding is not None
             else ""
         )
-        title = (
-            previous_binding.title
-            if previous_binding is not None
-            and previous_binding.title
-            and source_title == hermes_owned_title
-            else source_title
+        stored_guard_matches = bool(
+            previous_binding is not None
+            and hermes_owned_title
+            and await self.adapter.thread_name_matches(
+                chat_id,
+                hermes_owned_title,
+            )
         )
-        current_discord_title = hermes_owned_title or source_title
+        if previous_binding is not None:
+            title = (
+                previous_binding.title
+                if previous_binding.title
+                and stored_guard_matches
+                else raw_discord_title
+            )
+        else:
+            title = source_title
+        current_discord_title = hermes_owned_title or raw_discord_title
         with suppress(Exception):
             await self.client.request(
                 "thread/name/set", {"threadId": thread_id, "name": title}
@@ -921,11 +933,13 @@ class DiscordCodexGateway:
             title = self._task_title(tasks[0])
         source = event.source
         previous = self.bindings.bindings.get(str(source.chat_id))
-        current_discord_title = str(getattr(source, "chat_name", None) or "")
-        if previous is not None:
-            current_discord_title = (
-                previous.discord_title or previous.title or current_discord_title
-            )
+        current_discord_title = (
+            (previous.discord_title or previous.title)
+            if previous is not None
+            else ""
+        )
+        if not current_discord_title:
+            current_discord_title = await self._raw_discord_thread_name(source)
         provisional = CodexTaskBinding(
             discord_chat_id=str(source.chat_id),
             codex_thread_id=thread_id,
@@ -957,6 +971,15 @@ class DiscordCodexGateway:
             + (f" — **{provisional.title}**" if provisional.title else "")
             + "."
         )
+
+    async def _raw_discord_thread_name(self, source: Any) -> str:
+        """Return the raw Discord thread name used by the no-clobber guard."""
+        chat_info = await self.adapter.get_chat_info(str(source.chat_id))
+        if isinstance(chat_info, dict) and chat_info.get("type") == "thread":
+            raw_thread_name = str(chat_info.get("name") or "").strip()
+            if raw_thread_name:
+                return raw_thread_name
+        return str(getattr(source, "chat_name", None) or "Discord Codex task")
 
     async def _list_tasks(self, search_term: str) -> str:
         """List recent daemon tasks, optionally filtered by title substring."""
