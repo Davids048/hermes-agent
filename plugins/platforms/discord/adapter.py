@@ -13,6 +13,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
@@ -26,6 +27,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -38,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+_DISCORD_FENCED_CODE_BLOCK_RE = re.compile(
+    r"^(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)(?P=fence)[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def _format_discord_markdown_link(label: str, url: str) -> str:
@@ -97,6 +103,28 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
 })
+_CODEX_ACTIVITY_LOAD_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass
+class _DiscordCodexActivityPresentation:
+    """Collapsed and paginated expanded content for one Codex activity message."""
+
+    collapsed_content: str
+    expanded_pages: List[str]
+    expanded: bool = False
+    page_index: int = 0
+
+
+@dataclass(frozen=True)
+class _DiscordMessageDelivery:
+    """One ordered Discord message, optionally carrying a text attachment."""
+
+    content: str
+    attachment_name: Optional[str] = None
+    attachment_bytes: Optional[bytes] = None
+
+
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
@@ -1178,6 +1206,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # rate limit (~1 edit per stream tick for the rest of a long reply).
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
+        self._codex_activity_presentations: Dict[
+            str, _DiscordCodexActivityPresentation
+        ] = {}
+        self._codex_activity_ready_events: Dict[str, asyncio.Event] = {}
         self._warned_fail_closed_default = False
 
     def _config_value(
@@ -1384,6 +1416,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._client.add_view(CodexActivityView(self, register_all=True))
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -3433,6 +3466,207 @@ class DiscordAdapter(BasePlatformAdapter):
         kept.append(notice)
         return kept
 
+    def _message_deliveries(self, formatted: str) -> List[_DiscordMessageDelivery]:
+        """Plan text messages and attachments in source order.
+
+        A fenced code block whose complete Discord representation exceeds the
+        2,000-character message limit is delivered as one UTF-8 ``.txt`` file.
+        Text outside oversized blocks continues to use the adapter's normal
+        fence-aware message splitting.
+        """
+        deliveries: List[_DiscordMessageDelivery] = []
+        text_start = 0
+        attachment_index = 0
+        for match in _DISCORD_FENCED_CODE_BLOCK_RE.finditer(formatted):
+            if len(match.group(0)) <= self.MAX_MESSAGE_LENGTH:
+                continue
+            self._append_text_deliveries(
+                deliveries, formatted[text_start : match.start()]
+            )
+            attachment_index += 1
+            attachment_name = f"code-block-{attachment_index}.txt"
+            deliveries.append(
+                _DiscordMessageDelivery(
+                    content=f"📎 **Code block attached:** `{attachment_name}`",
+                    attachment_name=attachment_name,
+                    attachment_bytes=match.group("body").encode("utf-8"),
+                )
+            )
+            text_start = match.end()
+        self._append_text_deliveries(deliveries, formatted[text_start:])
+        return self._cap_message_deliveries(deliveries)
+
+    def _append_text_deliveries(
+        self,
+        deliveries: List[_DiscordMessageDelivery],
+        text: str,
+    ) -> None:
+        """Append nonempty text as Discord-sized delivery records."""
+        normalized_text = text.strip()
+        if not normalized_text:
+            return
+        for chunk in self.truncate_message(
+            normalized_text, self.MAX_MESSAGE_LENGTH
+        ):
+            deliveries.append(_DiscordMessageDelivery(content=chunk))
+
+    def _cap_message_deliveries(
+        self, deliveries: List[_DiscordMessageDelivery]
+    ) -> List[_DiscordMessageDelivery]:
+        """Apply the response flood limit to text and attachment messages."""
+        if len(deliveries) <= self.MAX_SPLIT_MESSAGES:
+            return deliveries
+        kept = deliveries[: self.MAX_SPLIT_MESSAGES - 1]
+        dropped_characters = sum(
+            len(delivery.content)
+            + len((delivery.attachment_bytes or b"").decode("utf-8"))
+            for delivery in deliveries[self.MAX_SPLIT_MESSAGES - 1 :]
+        )
+        kept.append(
+            _DiscordMessageDelivery(
+                content=(
+                    "⚠️ **Response truncated** — this reply exceeded the "
+                    f"delivery limit ({self.MAX_SPLIT_MESSAGES} messages). "
+                    f"{dropped_characters} characters were not delivered; "
+                    "the full response is in the session logs."
+                )
+            )
+        )
+        return kept
+
+    @staticmethod
+    def _delivery_file(delivery: _DiscordMessageDelivery) -> Any:
+        """Build a fresh Discord file object for one attachment attempt."""
+        if delivery.attachment_name is None:
+            return None
+        return discord.File(
+            io.BytesIO(delivery.attachment_bytes or b""),
+            filename=delivery.attachment_name,
+        )
+
+    def _codex_user_prompt_chunks(self, content: str) -> List[str]:
+        """Render terminal input as visible quoted text within Discord's limit."""
+        title = "**👤 You (Codex terminal)**"
+        continuation_title = "**👤 You (Codex terminal) · continued**"
+        quote_prefix = ">>> "
+        chunk_budget = (
+            self.MAX_MESSAGE_LENGTH
+            - len(continuation_title)
+            - len(quote_prefix)
+            - 1
+        )
+        source_chunks = self._cap_split_chunks(
+            self.truncate_message(content, chunk_budget)
+        )
+        rendered_chunks = []
+        for index, chunk in enumerate(source_chunks):
+            chunk_title = title
+            if index > 0:
+                chunk_title = continuation_title
+            rendered_chunks.append(f"{chunk_title}\n{quote_prefix}{chunk}")
+        return rendered_chunks
+
+    def register_codex_activity(
+        self,
+        message_id: str,
+        collapsed_content: str,
+        expanded_content: str,
+    ) -> None:
+        """Restore one activity button's content without editing Discord."""
+        previous = self._codex_activity_presentations.get(str(message_id))
+        collapsed = self.format_message(collapsed_content)
+        expanded = self.format_message(expanded_content)
+        pages = self.truncate_message(expanded, self.MAX_MESSAGE_LENGTH)
+        if not pages:
+            pages = ["No activity details were recorded for this turn."]
+        presentation = _DiscordCodexActivityPresentation(
+            collapsed_content=collapsed,
+            expanded_pages=pages,
+            expanded=previous.expanded if previous else False,
+            page_index=previous.page_index if previous else 0,
+        )
+        presentation.page_index = min(
+            presentation.page_index, len(presentation.expanded_pages) - 1
+        )
+        normalized_message_id = str(message_id)
+        self._codex_activity_presentations[normalized_message_id] = presentation
+        ready_event = self._codex_activity_ready_events.pop(
+            normalized_message_id, None
+        )
+        if ready_event is not None:
+            ready_event.set()
+
+    def _codex_activity_view(
+        self, presentation: _DiscordCodexActivityPresentation
+    ) -> Any:
+        """Build controls that match one activity message's visible state."""
+        return CodexActivityView(
+            self,
+            expanded=presentation.expanded,
+            page_index=presentation.page_index,
+            page_count=len(presentation.expanded_pages),
+        )
+
+    async def _handle_codex_activity_interaction(
+        self, interaction: Any, action: str
+    ) -> None:
+        """Apply a Show, Hide, Previous, or Next activity-button action."""
+        if not _component_check_auth(
+            interaction, self._allowed_user_ids, self._allowed_role_ids
+        ):
+            await interaction.response.send_message(
+                "You're not authorized to view this activity.", ephemeral=True
+            )
+            return
+        message_id = str(getattr(getattr(interaction, "message", None), "id", ""))
+        presentation = self._codex_activity_presentations.get(message_id)
+        deferred = False
+        if presentation is None:
+            ready_event = self._codex_activity_ready_events.setdefault(
+                message_id, asyncio.Event()
+            )
+            await interaction.response.defer()
+            deferred = True
+            try:
+                await asyncio.wait_for(
+                    ready_event.wait(),
+                    timeout=_CODEX_ACTIVITY_LOAD_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                if self._codex_activity_ready_events.get(message_id) is ready_event:
+                    self._codex_activity_ready_events.pop(message_id, None)
+                return
+            presentation = self._codex_activity_presentations.get(message_id)
+            if presentation is None:
+                return
+        if action == "show":
+            presentation.expanded = True
+            presentation.page_index = 0
+        elif action == "hide":
+            presentation.expanded = False
+        elif action == "previous":
+            presentation.expanded = True
+            presentation.page_index = max(0, presentation.page_index - 1)
+        elif action == "next":
+            presentation.expanded = True
+            presentation.page_index = min(
+                len(presentation.expanded_pages) - 1,
+                presentation.page_index + 1,
+            )
+        visible_content = (
+            presentation.expanded_pages[presentation.page_index]
+            if presentation.expanded
+            else presentation.collapsed_content
+        )
+        edit_kwargs = {
+            "content": visible_content,
+            "view": self._codex_activity_view(presentation),
+        }
+        if deferred:
+            await interaction.edit_original_response(**edit_kwargs)
+        else:
+            await interaction.response.edit_message(**edit_kwargs)
+
     async def send(
         self,
         chat_id: str,
@@ -3511,24 +3745,46 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self._cap_split_chunks(
-                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-            )
+            activity_presentation = None
+            if metadata and metadata.get("message_style") == "codex_turn_activity":
+                expanded_content = str(metadata.get("expanded_content") or formatted)
+                pages = self.truncate_message(
+                    self.format_message(expanded_content), self.MAX_MESSAGE_LENGTH
+                )
+                activity_presentation = _DiscordCodexActivityPresentation(
+                    collapsed_content=formatted,
+                    expanded_pages=pages or [formatted],
+                )
+                deliveries = [_DiscordMessageDelivery(content=formatted)]
+            elif metadata and metadata.get("message_style") == "codex_user_prompt":
+                deliveries = [
+                    _DiscordMessageDelivery(content=chunk)
+                    for chunk in self._codex_user_prompt_chunks(formatted)
+                ]
+            else:
+                deliveries = self._message_deliveries(formatted)
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
             reference = self._reply_reference_for_send(reply_to, channel)
 
-            for i, chunk in enumerate(chunks):
+            for i, delivery in enumerate(deliveries):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
-                try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
+                send_kwargs: Dict[str, Any] = {
+                    "content": delivery.content,
+                    "reference": chunk_reference,
+                }
+                if delivery.attachment_name is not None:
+                    send_kwargs["files"] = [self._delivery_file(delivery)]
+                if activity_presentation is not None:
+                    send_kwargs["view"] = self._codex_activity_view(
+                        activity_presentation
                     )
+                try:
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3547,13 +3803,26 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {
+                            "content": delivery.content,
+                            "reference": None,
+                        }
+                        if delivery.attachment_name is not None:
+                            retry_kwargs["files"] = [
+                                self._delivery_file(delivery)
+                            ]
+                        if activity_presentation is not None:
+                            retry_kwargs["view"] = self._codex_activity_view(
+                                activity_presentation
+                            )
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if activity_presentation is not None:
+                    self._codex_activity_presentations[str(msg.id)] = (
+                        activity_presentation
+                    )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3763,6 +4032,27 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
 
+            if metadata and metadata.get("message_style") == "codex_turn_activity":
+                return await self._edit_codex_activity_message(
+                    msg,
+                    message_id,
+                    content,
+                    formatted,
+                    finalize=finalize,
+                    metadata=metadata,
+                )
+
+            if metadata and metadata.get("message_style") == "codex_user_prompt":
+                return await self._edit_codex_user_prompt_message(
+                    channel,
+                    msg,
+                    message_id,
+                    content,
+                    formatted,
+                    finalize=finalize,
+                    metadata=metadata,
+                )
+
             _preview_key = (str(chat_id), str(message_id))
             _saturated_preview = False
             if finalize:
@@ -3833,6 +4123,83 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def _edit_codex_user_prompt_message(
+        self,
+        channel: Any,
+        message: Any,
+        message_id: str,
+        content: str,
+        formatted: str,
+        *,
+        finalize: bool,
+        metadata: Dict[str, Any],
+    ) -> SendResult:
+        """Replace one placeholder with visible terminal input and continuations."""
+        chunks = self._codex_user_prompt_chunks(formatted)
+        self._codex_activity_presentations.pop(str(message_id), None)
+        await message.edit(
+            content=chunks[0],
+            embed=None,
+            view=None,
+        )
+        message_ids = [str(message_id)]
+        for chunk in chunks[1:]:
+            continuation = await channel.send(
+                content=chunk,
+            )
+            message_ids.append(str(continuation.id))
+        result = SendResult(
+            success=True,
+            message_id=str(message_id),
+            raw_response={"message_ids": message_ids},
+        )
+        if finalize:
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=metadata.get("reply_to_message_id"),
+                result=result,
+                content=content,
+                final=True,
+            )
+        return result
+
+    async def _edit_codex_activity_message(
+        self,
+        message: Any,
+        message_id: str,
+        content: str,
+        formatted: str,
+        *,
+        finalize: bool,
+        metadata: Dict[str, Any],
+    ) -> SendResult:
+        """Update one activity message while preserving its expanded state."""
+        self.register_codex_activity(
+            message_id,
+            formatted,
+            str(metadata.get("expanded_content") or formatted),
+        )
+        presentation = self._codex_activity_presentations[str(message_id)]
+        visible_content = (
+            presentation.expanded_pages[presentation.page_index]
+            if presentation.expanded
+            else presentation.collapsed_content
+        )
+        await message.edit(
+            content=visible_content,
+            view=self._codex_activity_view(presentation),
+        )
+        result = SendResult(success=True, message_id=str(message_id))
+        if finalize:
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=metadata.get("reply_to_message_id"),
+                result=result,
+                content=content,
+                final=True,
+            )
+        return result
+
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
         """True when a Discord edit/send failed because text exceeded 2,000.
@@ -3854,36 +4221,42 @@ class DiscordAdapter(BasePlatformAdapter):
         message_id: str,
         content: str,
     ) -> SendResult:
-        """Deliver an oversized final edit across message + continuations.
+        """Deliver an oversized final edit across ordered Discord messages.
 
-        Edit the original ``message_id`` with chunk 1 (fence-aware, with the
-        usual ``(1/N)`` indicator), then send chunks 2..N as new messages each
-        threaded as a reply to the previous chunk so Discord groups them
-        visually.  Returns ``SendResult(success=True, message_id=<last-id>,
-        continuation_message_ids=(...))`` so the stream consumer keeps editing
-        the most recent visible message and can clean up every chunk on a
-        fresh-final.
+        Text uses fence-aware splitting. Oversized fenced code blocks become
+        single ``.txt`` attachments. The original ``message_id`` carries the
+        first delivery, and later deliveries reply to the preceding message.
 
         On a mid-stream continuation send failure we still report success with
-        however many continuations landed AND a ``partial_overflow``
+        however many deliveries landed AND a ``partial_overflow``
         raw_response so the consumer can deliver the missing tail rather than
         treating a clipped reply as complete — dropping chunks the user already
         saw would be the worse outcome.  Only a first-chunk edit failure
         returns ``success=False`` (a real adapter problem, not overflow).
         """
         formatted = self.format_message(content)
-        chunks = self._cap_split_chunks(
-            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        )
-        if len(chunks) <= 1:
+        deliveries = self._message_deliveries(formatted)
+        if len(deliveries) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted)
+            delivery = deliveries[0] if deliveries else _DiscordMessageDelivery(
+                content=formatted
+            )
+            edit_kwargs: Dict[str, Any] = {"content": delivery.content}
+            if delivery.attachment_name is not None:
+                edit_kwargs["attachments"] = [self._delivery_file(delivery)]
+            await msg.edit(**edit_kwargs)
             return SendResult(success=True, message_id=message_id)
 
-        # Step 1 — edit the existing message with the first chunk.
+        # Step 1 — edit the existing message with the first delivery.
         try:
-            await msg.edit(content=chunks[0])
+            first_delivery = deliveries[0]
+            edit_kwargs = {"content": first_delivery.content}
+            if first_delivery.attachment_name is not None:
+                edit_kwargs["attachments"] = [
+                    self._delivery_file(first_delivery)
+                ]
+            await msg.edit(**edit_kwargs)
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s",
@@ -3891,11 +4264,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
-        # Step 2 — send each remaining chunk threaded as a reply to the prior.
+        # Step 2 — send each remaining delivery as a reply to the prior.
         continuation_ids: list[str] = []
         delivered = 1
         prev_msg = msg
-        for chunk in chunks[1:]:
+        for delivery in deliveries[1:]:
             reference = None
             if hasattr(prev_msg, "to_reference"):
                 try:
@@ -3909,7 +4282,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 # overflow continuations stay threaded.
                 reference = self._message_reference_from_ids(prev_msg.id, channel)
             try:
-                sent = await channel.send(content=chunk, reference=reference)
+                send_kwargs = {
+                    "content": delivery.content,
+                    "reference": reference,
+                }
+                if delivery.attachment_name is not None:
+                    send_kwargs["files"] = [self._delivery_file(delivery)]
+                sent = await channel.send(**send_kwargs)
             except Exception as send_err:
                 # Drop the reply anchor and retry once — a deleted/expired
                 # anchor (10008) or system-message reply (50035) shouldn't lose
@@ -3919,11 +4298,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, send_err,
                 )
                 try:
-                    sent = await channel.send(content=chunk, reference=None)
+                    retry_kwargs = {
+                        "content": delivery.content,
+                        "reference": None,
+                    }
+                    if delivery.attachment_name is not None:
+                        retry_kwargs["files"] = [
+                            self._delivery_file(delivery)
+                        ]
+                    sent = await channel.send(**retry_kwargs)
                 except Exception as retry_err:
                     logger.warning(
-                        "[%s] Overflow split: stopped at %d/%d chunks delivered: %s",
-                        self.name, delivered, len(chunks), retry_err,
+                        "[%s] Overflow split: stopped at %d/%d deliveries: %s",
+                        self.name, delivered, len(deliveries), retry_err,
                     )
                     last_id = continuation_ids[-1] if continuation_ids else message_id
                     return SendResult(
@@ -3933,7 +4320,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         raw_response={
                             "partial_overflow": True,
                             "delivered_chunks": delivered,
-                            "total_chunks": len(chunks),
+                            "total_chunks": len(deliveries),
                             "last_message_id": last_id,
                             "continuation_message_ids": tuple(continuation_ids),
                         },
@@ -3949,7 +4336,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not _looks_like_nonconversational_history_message(content):
             self._last_self_message_id[str(channel.id)] = last_id
         logger.debug(
-            "[%s] Overflow split delivered %d chunks; last_id=%s",
+            "[%s] Overflow split delivered %d messages; last_id=%s",
             self.name, delivered, last_id,
         )
         return SendResult(
@@ -7417,6 +7804,98 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def create_codex_task_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+        *,
+        member_user_ids: tuple[str, ...] = (),
+    ) -> Optional[str]:
+        """Create and track a Discord thread that mirrors one Codex task."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+        try:
+            parent_id = int(parent_chat_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            parent = self._client.get_channel(parent_id)
+            if parent is None:
+                parent = await self._client.fetch_channel(parent_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Codex task thread: cannot resolve parent %s: %s",
+                self.name,
+                parent_chat_id,
+                exc,
+            )
+            return None
+        if isinstance(parent, getattr(discord, "DMChannel", ())):
+            return None
+        thread_name = (name or "Codex task").strip()[:80] or "Codex task"
+        try:
+            create = getattr(parent, "create_thread", None)
+            if create is not None:
+                thread = await create(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason="Codex task created by another client",
+                )
+                thread_id = str(thread.id)
+                await self._add_codex_task_thread_members(thread, member_user_ids)
+                self._threads.mark(thread_id)
+                return thread_id
+        except Exception as direct_error:
+            logger.debug(
+                "[%s] Codex task thread: direct create failed (%s); trying seed fallback",
+                self.name,
+                direct_error,
+            )
+        try:
+            send = getattr(parent, "send", None)
+            if send is None:
+                return None
+            seed_message = await send(f"🧵 Codex task: **{thread_name}**")
+            thread = await seed_message.create_thread(
+                name=thread_name,
+                auto_archive_duration=1440,
+                reason="Codex task created by another client",
+            )
+            thread_id = str(thread.id)
+            await self._add_codex_task_thread_members(thread, member_user_ids)
+            self._threads.mark(thread_id)
+            return thread_id
+        except Exception as fallback_error:
+            logger.warning(
+                "[%s] Codex task thread: both create paths failed for parent %s: %s",
+                self.name,
+                parent_chat_id,
+                fallback_error,
+            )
+            return None
+
+    async def _add_codex_task_thread_members(
+        self, thread: Any, member_user_ids: tuple[str, ...]
+    ) -> None:
+        """Join configured Discord accounts to an auto-created Codex task thread."""
+        for member_user_id in member_user_ids:
+            try:
+                member = discord.Object(id=int(member_user_id))
+                await thread.add_user(member)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[%s] Codex task thread member id is invalid: %r",
+                    self.name,
+                    member_user_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[%s] Could not add Discord user %s to Codex task thread %s",
+                    self.name,
+                    member_user_id,
+                    getattr(thread, "id", "unknown"),
+                )
+
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
     ) -> str:
@@ -8782,7 +9261,84 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global CodexActivityView, ExecApprovalView, SlashConfirmView, UpdatePromptView
+    global ModelPickerView, ClarifyChoiceView, ChoicePickerView
+
+    class CodexActivityView(discord.ui.View):
+        """Persistent controls that expand, page, and collapse Codex activity."""
+
+        def __init__(
+            self,
+            adapter: Any,
+            *,
+            expanded: bool = False,
+            page_index: int = 0,
+            page_count: int = 1,
+            register_all: bool = False,
+        ):
+            """Keep only controls that apply to the rendered activity page."""
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            if register_all:
+                return
+            visible_ids = {"codex_activity_show"}
+            if expanded:
+                visible_ids = {"codex_activity_hide"}
+                if page_index > 0:
+                    visible_ids.add("codex_activity_previous")
+                if page_index + 1 < page_count:
+                    visible_ids.add("codex_activity_next")
+            for child in list(self.children):
+                if getattr(child, "custom_id", None) not in visible_ids:
+                    self.remove_item(child)
+
+        @discord.ui.button(
+            label="Show activity",
+            style=discord.ButtonStyle.secondary,
+            custom_id="codex_activity_show",
+        )
+        async def show_activity(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            await self.adapter._handle_codex_activity_interaction(
+                interaction, "show"
+            )
+
+        @discord.ui.button(
+            label="Previous",
+            style=discord.ButtonStyle.secondary,
+            custom_id="codex_activity_previous",
+        )
+        async def previous_page(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            await self.adapter._handle_codex_activity_interaction(
+                interaction, "previous"
+            )
+
+        @discord.ui.button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            custom_id="codex_activity_next",
+        )
+        async def next_page(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            await self.adapter._handle_codex_activity_interaction(
+                interaction, "next"
+            )
+
+        @discord.ui.button(
+            label="Hide activity",
+            style=discord.ButtonStyle.secondary,
+            custom_id="codex_activity_hide",
+        )
+        async def hide_activity(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            await self.adapter._handle_codex_activity_interaction(
+                interaction, "hide"
+            )
 
     class ExecApprovalView(discord.ui.View):
         """

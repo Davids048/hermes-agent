@@ -6858,6 +6858,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Optional Discord transport whose conversation owner is the shared
+        # Codex app-server daemon instead of Hermes AIAgent.
+        self._codex_daemon_gateway = None
         # When non-None, SessionDB init failed — the gateway broadcasts a
         # one-time warning to the home channel(s) after connecting, so the
         # user knows persistence is broken instead of discovering it later
@@ -13223,6 +13226,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
 
+        discord_adapter = self.adapters.get(Platform.DISCORD)
+        if discord_adapter is not None:
+            from gateway.codex_daemon_gateway import start_codex_daemon_gateway
+
+            self._codex_daemon_gateway = await start_codex_daemon_gateway(
+                discord_adapter
+            )
+
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
@@ -15121,6 +15132,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
 
+            codex_daemon_gateway = getattr(self, "_codex_daemon_gateway", None)
+            if codex_daemon_gateway is not None:
+                await codex_daemon_gateway.stop()
+                self._codex_daemon_gateway = None
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -16877,6 +16893,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        codex_daemon_gateway = getattr(self, "_codex_daemon_gateway", None)
+        if (
+            codex_daemon_gateway is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+        ):
+            return await codex_daemon_gateway.handle_message(event)
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events

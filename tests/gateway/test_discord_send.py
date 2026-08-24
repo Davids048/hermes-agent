@@ -45,6 +45,325 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
+
+
+def _capture_discord_text_file(monkeypatch):
+    """Replace discord.File with a readable in-memory attachment record."""
+    created_files = []
+
+    def build_file(fp, filename=None, **_kwargs):
+        captured_file = SimpleNamespace(fp=fp, filename=filename)
+        created_files.append(captured_file)
+        return captured_file
+
+    monkeypatch.setattr(discord_platform.discord, "File", build_file)
+    return created_files
+
+
+@pytest.mark.asyncio
+async def test_send_oversized_fenced_code_block_uses_text_attachment(
+    monkeypatch,
+):
+    """An oversized code block stays atomic between surrounding prose."""
+    created_files = _capture_discord_text_file(monkeypatch)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent_messages = []
+
+    async def send_message(**kwargs):
+        sent_messages.append(kwargs)
+        return SimpleNamespace(id=800 + len(sent_messages))
+
+    channel = SimpleNamespace(send=AsyncMock(side_effect=send_message))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    code = "line\n" * 420
+
+    result = await adapter.send(
+        "555",
+        f"Before diagram.\n\n```text\n{code}```\n\nAfter diagram.",
+    )
+
+    assert result.success is True
+    assert [message["content"] for message in sent_messages] == [
+        "Before diagram.",
+        "📎 **Code block attached:** `code-block-1.txt`",
+        "After diagram.",
+    ]
+    assert "files" not in sent_messages[0]
+    assert sent_messages[1]["files"] == [created_files[0]]
+    assert created_files[0].filename == "code-block-1.txt"
+    assert created_files[0].fp.getvalue() == code.encode("utf-8")
+    assert "files" not in sent_messages[2]
+
+
+@pytest.mark.asyncio
+async def test_send_fenced_code_block_at_message_limit_stays_inline():
+    """A fenced block that fits Discord's limit remains normal Markdown."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=888)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    fenced_code = f"```\n{'x' * 1992}\n```"
+
+    result = await adapter.send("555", fenced_code)
+
+    assert len(fenced_code) == adapter.MAX_MESSAGE_LENGTH
+    assert result.success is True
+    call = channel.send.await_args.kwargs
+    assert call["content"] == fenced_code
+    assert "files" not in call
+
+
+@pytest.mark.asyncio
+async def test_edit_message_oversized_fenced_code_block_uses_text_attachment(
+    monkeypatch,
+):
+    """A streamed answer finalizes into one attachment on its original message."""
+    created_files = _capture_discord_text_file(monkeypatch)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(
+        get_partial_message=MagicMock(return_value=message),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    code = "diagram row\n" * 190
+
+    result = await adapter.edit_message(
+        "555",
+        "777",
+        f"```text\n{code}```",
+        finalize=True,
+    )
+
+    assert result.success is True
+    assert result.message_id == "777"
+    edit = message.edit.await_args.kwargs
+    assert edit["content"] == "📎 **Code block attached:** `code-block-1.txt`"
+    assert edit["attachments"] == [created_files[0]]
+    assert created_files[0].fp.getvalue() == code.encode("utf-8")
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_codex_user_prompt_uses_visible_quoted_text():
+    """Terminal-authored Codex input is visible without Discord embeds."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=888)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "terminal input",
+        metadata={"message_style": "codex_user_prompt"},
+    )
+
+    assert result.success is True
+    call = channel.send.await_args.kwargs
+    assert call["content"] == "**👤 You (Codex terminal)**\n>>> terminal input"
+    assert "embed" not in call
+
+
+@pytest.mark.asyncio
+async def test_edit_message_codex_user_prompt_replaces_placeholder_with_text():
+    """A working placeholder becomes separate visible terminal-input text."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(
+        get_partial_message=MagicMock(return_value=message),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter.register_codex_activity("777", "working", "command output")
+
+    result = await adapter.edit_message(
+        "555",
+        "777",
+        "terminal input",
+        finalize=True,
+        metadata={"message_style": "codex_user_prompt"},
+    )
+
+    assert result.success is True
+    call = message.edit.await_args.kwargs
+    assert call["content"] == "**👤 You (Codex terminal)**\n>>> terminal input"
+    assert call["embed"] is None
+    assert call["view"] is None
+    assert "777" not in adapter._codex_activity_presentations
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_codex_turn_activity_adds_collapsed_controls(monkeypatch):
+    """A Codex activity message starts collapsed with persistent controls."""
+    monkeypatch.setattr(
+        discord_platform,
+        "CodexActivityView",
+        lambda *args, **kwargs: SimpleNamespace(kwargs=kwargs),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=888)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "⏳ **Activity · 2 steps**\n1 command · 1 update",
+        metadata={
+            "message_style": "codex_turn_activity",
+            "expanded_content": "### Codex activity\n\ncommand details",
+        },
+    )
+
+    assert result.success is True
+    call = channel.send.await_args.kwargs
+    assert call["content"] == "⏳ **Activity · 2 steps**\n1 command · 1 update"
+    assert call["view"].kwargs["expanded"] is False
+    presentation = adapter._codex_activity_presentations["888"]
+    assert presentation.expanded_pages == [
+        "### Codex activity\n\ncommand details"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_codex_activity_interaction_pages_and_collapses(monkeypatch):
+    """Activity controls reveal every page and restore the compact summary."""
+    monkeypatch.setattr(
+        discord_platform,
+        "CodexActivityView",
+        lambda *args, **kwargs: SimpleNamespace(kwargs=kwargs),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"123"}
+    adapter.register_codex_activity("888", "collapsed", "x" * 2500)
+    response = SimpleNamespace(
+        edit_message=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, roles=[]),
+        message=SimpleNamespace(id=888),
+        response=response,
+    )
+
+    await adapter._handle_codex_activity_interaction(interaction, "show")
+    first_page = response.edit_message.await_args.kwargs
+    assert len(first_page["content"]) <= adapter.MAX_MESSAGE_LENGTH
+    assert first_page["view"].kwargs["expanded"] is True
+
+    await adapter._handle_codex_activity_interaction(interaction, "next")
+    second_page = response.edit_message.await_args.kwargs
+    assert second_page["content"] != first_page["content"]
+    assert second_page["view"].kwargs["page_index"] == 1
+
+    await adapter._handle_codex_activity_interaction(interaction, "hide")
+    collapsed = response.edit_message.await_args.kwargs
+    assert collapsed["content"] == "collapsed"
+    assert collapsed["view"].kwargs["expanded"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_codex_activity_interaction_waits_without_notification(
+    monkeypatch,
+):
+    """A restart-time click waits for history without posting a Discord message."""
+    monkeypatch.setattr(
+        discord_platform,
+        "CodexActivityView",
+        lambda *args, **kwargs: SimpleNamespace(kwargs=kwargs),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"123"}
+    deferred = asyncio.Event()
+
+    async def mark_deferred():
+        deferred.set()
+
+    response = SimpleNamespace(
+        defer=AsyncMock(side_effect=mark_deferred),
+        edit_message=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, roles=[]),
+        message=SimpleNamespace(id=888),
+        response=response,
+        edit_original_response=AsyncMock(),
+    )
+
+    interaction_task = asyncio.create_task(
+        adapter._handle_codex_activity_interaction(interaction, "show")
+    )
+    await deferred.wait()
+    adapter.register_codex_activity("888", "collapsed", "expanded details")
+    await interaction_task
+
+    response.send_message.assert_not_awaited()
+    response.edit_message.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once()
+    edit = interaction.edit_original_response.await_args.kwargs
+    assert edit["content"] == "expanded details"
+    assert edit["view"].kwargs["expanded"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_codex_task_thread_uses_configured_parent(
+    monkeypatch, tmp_path
+):
+    """A daemon task receives a tracked Discord thread under the home channel."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        discord_platform.discord,
+        "Object",
+        lambda *, id: SimpleNamespace(id=id),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    created_thread = SimpleNamespace(id=777, add_user=AsyncMock())
+    parent = SimpleNamespace(
+        create_thread=AsyncMock(return_value=created_thread),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    thread_id = await adapter.create_codex_task_thread(
+        "555",
+        "Terminal task",
+        member_user_ids=("123",),
+    )
+
+    assert thread_id == "777"
+    assert "777" in adapter._threads
+    parent.create_thread.assert_awaited_once_with(
+        name="Terminal task",
+        auto_archive_duration=1440,
+        reason="Codex task created by another client",
+    )
+    created_thread.add_user.assert_awaited_once()
+    assert created_thread.add_user.await_args.args[0].id == 123
 
 
 @pytest.mark.asyncio
@@ -416,5 +735,3 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
-
