@@ -20,6 +20,7 @@ import pytest
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
+    CodexServerRequestView,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -68,6 +69,10 @@ def _interaction(user_id, role_ids=None, *, drop_user=False, drop_roles=False):
     if not drop_roles:
         user_kwargs["roles"] = [SimpleNamespace(id=r) for r in (role_ids or [])]
     return SimpleNamespace(user=SimpleNamespace(**user_kwargs))
+
+
+async def _resolve_codex_action(_action):
+    return True
 
 
 # ── no policy configured -> deny unless allow-all is explicit ──────────────
@@ -145,6 +150,17 @@ def test_clarify_choice_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
+def test_codex_server_request_view_accepts_role_allowlist():
+    view = CodexServerRequestView(
+        actions=[],
+        on_action=_resolve_codex_action,
+        allowed_user_ids=set(),
+        allowed_role_ids={42},
+    )
+    assert view._check_auth(_interaction(99999, role_ids=[42])) is True
+    assert view._check_auth(_interaction(99999, role_ids=[7])) is False
+
+
 # ---------------------------------------------------------------------------
 # Empty allowlists across views: fail closed unless allow-all is explicit.
 # ---------------------------------------------------------------------------
@@ -159,6 +175,11 @@ def test_clarify_choice_view_accepts_role_allowlist():
         lambda: ClarifyChoiceView(
             choices=["one"],
             clarify_id="c",
+            allowed_user_ids=set(),
+        ),
+        lambda: CodexServerRequestView(
+            actions=[],
+            on_action=_resolve_codex_action,
             allowed_user_ids=set(),
         ),
     ],

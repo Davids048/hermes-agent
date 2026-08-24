@@ -28,13 +28,16 @@ import traceback
 from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 from urllib.parse import quote, urljoin
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
 from agent.display import ToolPreview
+
+if TYPE_CHECKING:
+    from gateway.codex_daemon_gateway import CodexDiscordAction
 
 logger = logging.getLogger(__name__)
 
@@ -7992,6 +7995,50 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
 
+    async def send_codex_server_request(
+        self,
+        chat_id: str,
+        prompt: str,
+        actions: List["CodexDiscordAction"],
+        on_action: Callable[["CodexDiscordAction"], Awaitable[bool]],
+    ) -> SendResult:
+        """Render controls that submit a pending Codex app-server response.
+
+        The Codex gateway owns protocol response construction and request queue
+        state. This method owns Discord rendering, authorization, and component
+        lifecycle behavior.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        prompt_result = None
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            content = str(prompt or "")
+            if len(content) > self.MAX_MESSAGE_LENGTH:
+                prompt_result = await self.send(chat_id, content)
+                if not prompt_result.success:
+                    return prompt_result
+                content = "Choose a response for the Codex request."
+            view = CodexServerRequestView(
+                actions=actions,
+                on_action=on_action,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+            message = await channel.send(content=content, view=view)
+            view._message = message
+            return SendResult(success=True, message_id=str(message.id))
+        except Exception as exc:
+            if prompt_result is not None:
+                logger.warning(
+                    "Discord sent a Codex prompt without its response controls",
+                    exc_info=True,
+                )
+                return prompt_result
+            return SendResult(success=False, error=str(exc))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -9320,7 +9367,8 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global CodexActivityView, ExecApprovalView, SlashConfirmView, UpdatePromptView
+    global CodexActivityView, CodexServerRequestView, ExecApprovalView
+    global SlashConfirmView, UpdatePromptView
     global ModelPickerView, ClarifyChoiceView, ChoicePickerView
 
     class CodexActivityView(discord.ui.View):
@@ -9398,6 +9446,129 @@ def _define_discord_view_classes() -> None:
             await self.adapter._handle_codex_activity_interaction(
                 interaction, "hide"
             )
+
+    class CodexServerRequestView(discord.ui.View):
+        """Controls that submit one pending Codex app-server request."""
+
+        def __init__(
+            self,
+            actions: List["CodexDiscordAction"],
+            on_action: Callable[["CodexDiscordAction"], Awaitable[bool]],
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            """Build one authorized Discord button for each Codex response."""
+            super().__init__(timeout=_read_discord_prompt_timeout())
+            self.on_action = on_action
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.resolved = False
+            styles = {
+                "primary": discord.ButtonStyle.blurple,
+                "secondary": discord.ButtonStyle.grey,
+                "success": discord.ButtonStyle.green,
+                "danger": discord.ButtonStyle.red,
+            }
+            for index, action in enumerate(actions[:25]):
+                button = discord.ui.Button(
+                    label=_truncate_discord_component_text(
+                        action.label, _DISCORD_BUTTON_LABEL_LIMIT
+                    ),
+                    style=styles[action.style],
+                    custom_id=f"codex_request:{index}",
+                )
+                button.callback = self._make_action_callback(action)
+                self.add_item(button)
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids
+            )
+
+        def _make_action_callback(self, action: "CodexDiscordAction"):
+            async def _callback(interaction: discord.Interaction) -> None:
+                await self._resolve(interaction, action)
+            return _callback
+
+        async def _resolve(
+            self,
+            interaction: discord.Interaction,
+            action: "CodexDiscordAction",
+        ) -> None:
+            """Submit an authorized action and disable the completed prompt."""
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This Codex prompt has already been answered.", ephemeral=True
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this Codex prompt.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                accepted = await self.on_action(action)
+            except Exception:
+                logger.exception("Discord could not submit a Codex prompt response")
+                await interaction.response.send_message(
+                    "Codex could not accept this response. Try again.", ephemeral=True
+                )
+                return
+            if not accepted:
+                await interaction.response.send_message(
+                    "This Codex prompt is no longer pending.", ephemeral=True
+                )
+                return
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            message = getattr(interaction, "message", None)
+            original_content = str(getattr(message, "content", "") or "")
+            display_name = str(
+                getattr(getattr(interaction, "user", None), "display_name", "user")
+            )
+            icon = "⛔" if action.style == "danger" else "✅"
+            display_label = _truncate_discord_component_text(
+                action.label, _DISCORD_BUTTON_LABEL_LIMIT
+            )
+            status_line = f"\n\n{icon} **{display_label}** by {display_name}"
+            content = original_content[: 2000 - len(status_line)]
+            try:
+                await interaction.response.edit_message(
+                    content=f"{content}{status_line}", view=self
+                )
+            except Exception:
+                logger.debug(
+                    "Discord interaction edit failed after a Codex response",
+                    exc_info=True,
+                )
+                stored_message = getattr(self, "_message", None)
+                if stored_message is not None:
+                    try:
+                        await stored_message.edit(
+                            content=f"{content}{status_line}", view=self
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Discord could not mark a resolved Codex prompt",
+                            exc_info=True,
+                        )
+
+        async def on_timeout(self) -> None:
+            """Disable controls after the Discord interaction token expires."""
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            message = getattr(self, "_message", None)
+            if message is None:
+                return
+            try:
+                await message.edit(view=self)
+            except Exception:
+                logger.debug(
+                    "Discord could not expire a Codex prompt view", exc_info=True
+                )
 
     class ExecApprovalView(discord.ui.View):
         """

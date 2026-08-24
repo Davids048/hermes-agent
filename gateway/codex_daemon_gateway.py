@@ -10,6 +10,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 import aiohttp
 import yaml
@@ -633,6 +634,16 @@ class PendingCodexServerRequest:
     request_id: Any
     method: str
     params: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CodexDiscordAction:
+    """One Discord control and the gateway response that it represents."""
+
+    label: str
+    kind: Literal["approval", "answer"]
+    value: str
+    style: Literal["primary", "secondary", "success", "danger"]
 
 
 @dataclass
@@ -1873,8 +1884,41 @@ class DiscordCodexGateway:
             return
         for chat_id in chat_ids:
             queue = self.pending_server_requests.setdefault(chat_id, [])
-            queue.append(PendingCodexServerRequest(request_id, method, params))
-            await self.adapter.send(chat_id, self._server_request_prompt(method, params))
+            pending_request = PendingCodexServerRequest(request_id, method, params)
+            queue.append(pending_request)
+            prompt = self._server_request_prompt(method, params)
+            actions = self._server_request_actions(method, params)
+            # Prefer native controls while preserving text replies for adapters
+            # that cannot render Discord components.
+            send_interactive_prompt = getattr(
+                self.adapter, "send_codex_server_request", None
+            )
+            if actions and callable(send_interactive_prompt):
+                try:
+                    result = await send_interactive_prompt(
+                        chat_id=chat_id,
+                        prompt=prompt,
+                        actions=actions,
+                        on_action=partial(
+                            self._resolve_server_request_action,
+                            chat_id,
+                            pending_request,
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Discord component delivery failed for Codex request %s",
+                        request_id,
+                    )
+                else:
+                    if result.success:
+                        continue
+                    logger.warning(
+                        "Discord component delivery failed for Codex request %s: %s",
+                        request_id,
+                        result.error,
+                    )
+            await self.adapter.send(chat_id, prompt)
 
     async def _show_turn_started(self, chat_id: str, turn_id: str) -> None:
         """Create one collapsed activity message for a newly observed turn."""
@@ -2406,6 +2450,152 @@ class DiscordCodexGateway:
             return "**Context compacted**"
         return None
 
+    def _server_request_actions(
+        self, method: str, params: dict[str, Any]
+    ) -> list[CodexDiscordAction]:
+        """Map a Codex server request to controls that Discord can render."""
+        if method == "item/commandExecution/requestApproval":
+            action_by_decision = {
+                "accept": CodexDiscordAction(
+                    "Approve Once", "approval", "approve", "success"
+                ),
+                "acceptForSession": CodexDiscordAction(
+                    "Approve Session", "approval", "always", "secondary"
+                ),
+                "decline": CodexDiscordAction(
+                    "Deny", "approval", "deny", "danger"
+                ),
+                "cancel": CodexDiscordAction(
+                    "Cancel Turn", "approval", "cancel", "danger"
+                ),
+            }
+            available_decisions = params.get("availableDecisions")
+            if isinstance(available_decisions, list):
+                return [
+                    action_by_decision[decision]
+                    for decision in available_decisions
+                    if isinstance(decision, str) and decision in action_by_decision
+                ]
+            return [
+                action_by_decision["accept"],
+                action_by_decision["acceptForSession"],
+                action_by_decision["decline"],
+            ]
+        if method in {
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        }:
+            return [
+                CodexDiscordAction("Approve Once", "approval", "approve", "success"),
+                CodexDiscordAction(
+                    "Approve Session", "approval", "always", "secondary"
+                ),
+                CodexDiscordAction("Deny", "approval", "deny", "danger"),
+            ]
+        if method == "item/tool/requestUserInput":
+            questions = params.get("questions") or []
+            if len(questions) != 1:
+                return []
+            options = questions[0].get("options") or []
+            return [
+                CodexDiscordAction(
+                    str(option.get("label") or ""),
+                    "answer",
+                    str(option.get("label") or ""),
+                    "primary",
+                )
+                for option in options[:25]
+                if str(option.get("label") or "").strip()
+            ]
+        if method != "mcpServer/elicitation/request":
+            return []
+        if params.get("mode") == "url" or params.get("url"):
+            return [
+                CodexDiscordAction("Allow", "approval", "approve", "success"),
+                CodexDiscordAction("Deny", "approval", "deny", "danger"),
+            ]
+        schema = params.get("requestedSchema") or {}
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not properties:
+            return [
+                CodexDiscordAction("Allow", "answer", "{}", "success"),
+                CodexDiscordAction("Deny", "approval", "deny", "danger"),
+            ]
+        if not isinstance(properties, dict) or len(properties) != 1:
+            return [CodexDiscordAction("Deny", "approval", "deny", "danger")]
+        field_name, field_schema = next(iter(properties.items()))
+        choices = self._mcp_single_select_choices(field_schema)
+        if not 0 < len(choices) <= 24:
+            return [CodexDiscordAction("Deny", "approval", "deny", "danger")]
+        actions = [
+            CodexDiscordAction(
+                label,
+                "answer",
+                json.dumps({field_name: value}, separators=(",", ":")),
+                "primary",
+            )
+            for label, value in choices
+        ]
+        actions.append(
+            CodexDiscordAction("Decline request", "approval", "deny", "danger")
+        )
+        return actions
+
+    @staticmethod
+    def _mcp_single_select_choices(field_schema: Any) -> list[tuple[str, Any]]:
+        """Return display labels and values from one MCP single-select schema."""
+        if not isinstance(field_schema, dict):
+            return []
+        titled_choices = field_schema.get("oneOf")
+        if isinstance(titled_choices, list) and all(
+            isinstance(choice, dict) and "const" in choice
+            for choice in titled_choices
+        ):
+            return [
+                (
+                    DiscordCodexGateway._mcp_choice_label(
+                        choice.get("title"), choice["const"]
+                    ),
+                    choice["const"],
+                )
+                for choice in titled_choices
+            ]
+        values = field_schema.get("enum")
+        if not isinstance(values, list):
+            return []
+        titles = field_schema.get("enumNames")
+        if not isinstance(titles, list) or len(titles) != len(values):
+            titles = values
+        return [
+            (DiscordCodexGateway._mcp_choice_label(title, value), value)
+            for title, value in zip(titles, values)
+        ]
+
+    @staticmethod
+    def _mcp_choice_label(title: Any, value: Any) -> str:
+        """Return a non-empty Discord label for one MCP choice value."""
+        if isinstance(title, str) and title:
+            return title
+        return json.dumps(value, ensure_ascii=False)
+
+    async def _resolve_server_request_action(
+        self,
+        chat_id: str,
+        pending_request: PendingCodexServerRequest,
+        action: CodexDiscordAction,
+    ) -> bool:
+        """Submit one Discord interaction to the matching pending Codex request."""
+        lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            queue = self.pending_server_requests.get(chat_id, [])
+            if not queue or queue[0] is not pending_request:
+                return False
+            if action.kind == "approval":
+                response = await self._resolve_pending_request(chat_id, action.value)
+                return response.startswith("Codex request resolved")
+            response = await self._answer_user_input(chat_id, action.value)
+            return response.startswith("Codex received")
+
     async def _resolve_pending_request(self, chat_id: str, command: str) -> str:
         """Resolve the oldest approval request with an exact Codex result shape."""
         queue = self.pending_server_requests.get(chat_id, [])
@@ -2421,6 +2611,25 @@ class DiscordCodexGateway:
                 decision = "decline"
             elif command == "cancel":
                 decision = "cancel"
+            available_decisions = pending.params.get("availableDecisions")
+            if (
+                isinstance(available_decisions, list)
+                and decision not in available_decisions
+            ):
+                available_commands = {
+                    "accept": "`/approve`",
+                    "acceptForSession": "`/approve session`",
+                    "decline": "`/deny`",
+                    "cancel": "`/cancel`",
+                }
+                offered = [
+                    available_commands[value]
+                    for value in available_decisions
+                    if isinstance(value, str) and value in available_commands
+                ]
+                if offered:
+                    return "Codex offered these responses: " + ", ".join(offered)
+                return "Answer this command approval in a Codex client."
             result = {"decision": decision}
         elif method == "item/fileChange/requestApproval":
             decision = "acceptForSession" if session_scope else "accept"
@@ -2430,24 +2639,39 @@ class DiscordCodexGateway:
                 decision = "cancel"
             result = {"decision": decision}
         elif method == "item/permissions/requestApproval":
+            requested_permissions = pending.params.get("permissions", {})
+            granted_permissions = {
+                key: value
+                for key, value in requested_permissions.items()
+                if key in {"network", "fileSystem"} and value is not None
+            }
             result = {
-                "permissions": pending.params.get("permissions", {}) if accept else {},
+                "permissions": granted_permissions if accept else {},
                 "scope": "session" if session_scope and accept else "turn",
             }
         elif method == "mcpServer/elicitation/request":
             if accept:
-                if pending.params.get("mode") != "url":
-                    return "Use `/answer {\"field\": \"value\"}` for this MCP form."
-                result = {"action": "accept", "content": None, "_meta": None}
+                if (
+                    pending.params.get("mode") == "url"
+                    or pending.params.get("url")
+                ):
+                    content = None
+                else:
+                    schema = pending.params.get("requestedSchema") or {}
+                    properties = (
+                        schema.get("properties") if isinstance(schema, dict) else None
+                    )
+                    if properties:
+                        return "Use `/answer {\"field\": \"value\"}` for this MCP form."
+                    content = {}
+                result = {"action": "accept", "content": content, "_meta": None}
             else:
                 action = "cancel" if command == "cancel" else "decline"
                 result = {"action": action, "content": None, "_meta": None}
         else:
             return "Use `/answer ...` to answer the pending Codex question."
-        queue.pop(0)
-        if not queue:
-            self.pending_server_requests.pop(chat_id, None)
         await self.client.respond(pending.request_id, result)
+        self._dequeue_pending_request(chat_id, pending)
         return f"Codex request resolved with `{command}`."
 
     async def _answer_user_input(self, chat_id: str, answer_text: str) -> str:
@@ -2460,14 +2684,18 @@ class DiscordCodexGateway:
             try:
                 content = json.loads(answer_text)
             except json.JSONDecodeError:
+                schema = pending.params.get("requestedSchema") or {}
+                properties = (
+                    schema.get("properties") if isinstance(schema, dict) else None
+                )
+                if not properties:
+                    return "Allow this MCP request with `/answer {}` or deny it with `/deny`."
                 return "Answer the MCP form with `/answer {\"field\": \"value\"}`."
-            queue.pop(0)
-            if not queue:
-                self.pending_server_requests.pop(chat_id, None)
             await self.client.respond(
                 pending.request_id,
                 {"action": "accept", "content": content, "_meta": None},
             )
+            self._dequeue_pending_request(chat_id, pending)
             return "Codex received the MCP form response."
         if pending.method != "item/tool/requestUserInput":
             return "The pending Codex request expects `/approve` or `/deny`."
@@ -2488,11 +2716,19 @@ class DiscordCodexGateway:
                     ids = ", ".join(str(q.get("id") or "") for q in questions)
                     return f"Answer every question as `/answer id=value | id=value`. IDs: {ids}"
                 answers[question_id] = {"answers": [parsed[question_id]]}
-        queue.pop(0)
+        await self.client.respond(pending.request_id, {"answers": answers})
+        self._dequeue_pending_request(chat_id, pending)
+        return "Codex received your answer."
+
+    def _dequeue_pending_request(
+        self, chat_id: str, pending: PendingCodexServerRequest
+    ) -> None:
+        """Remove a response only after Codex accepts the client result."""
+        queue = self.pending_server_requests.get(chat_id, [])
+        if queue and queue[0] is pending:
+            queue.pop(0)
         if not queue:
             self.pending_server_requests.pop(chat_id, None)
-        await self.client.respond(pending.request_id, {"answers": answers})
-        return "Codex received your answer."
 
     def _server_request_prompt(
         self, method: str, params: dict[str, Any]
@@ -2502,10 +2738,25 @@ class DiscordCodexGateway:
         reason_line = f"\nReason: {reason}" if reason else ""
         if method == "item/commandExecution/requestApproval":
             command = self._escape_code_fence(str(params.get("command") or ""))
+            command_by_value = {
+                "approve": "`/approve`",
+                "always": "`/approve session`",
+                "deny": "`/deny`",
+                "cancel": "`/cancel`",
+            }
+            reply_options = [
+                command_by_value[action.value]
+                for action in self._server_request_actions(method, params)
+            ]
+            response_instruction = (
+                "Reply " + ", ".join(reply_options) + "."
+                if reply_options
+                else "Answer this approval in a Codex client."
+            )
             return (
                 f"⚠️ **Codex requests command approval**{reason_line}\n"
                 f"```sh\n{command}\n```\n"
-                "Reply `/approve`, `/approve session`, or `/deny`."
+                f"{response_instruction}"
             )
         if method == "item/fileChange/requestApproval":
             return (
@@ -2528,11 +2779,23 @@ class DiscordCodexGateway:
                     f"{message}\n{url}\n"
                     "Reply `/approve` or `/deny`."
                 )
-            schema = json.dumps(params.get("requestedSchema", {}), indent=2)
+            requested_schema = params.get("requestedSchema") or {}
+            schema = json.dumps(requested_schema, indent=2)
+            properties = (
+                requested_schema.get("properties")
+                if isinstance(requested_schema, dict)
+                else None
+            )
+            response_instruction = (
+                "Choose Allow or Deny below. Text fallback: send `{}` or `/deny`."
+                if not properties
+                else "Use a choice button when shown, or send a JSON object such as "
+                "`{\"field\": \"value\"}`. Reply `/deny` to decline."
+            )
             return (
                 f"❓ **{params.get('serverName', 'MCP server')} needs form input**\n"
                 f"{message}\n```json\n{schema}\n```\n"
-                "Send a JSON object such as `{\"field\": \"value\"}`, or reply `/deny`."
+                f"{response_instruction}"
             )
         lines = ["❓ **Codex needs input**"]
         for question in params.get("questions") or []:

@@ -51,6 +51,7 @@ class FakeDiscordAdapter:
         }
         self.thread_name_match_results: dict[tuple[str, str], bool] = {}
         self.registered_activities: list[tuple[str, str, str]] = []
+        self.codex_request_prompts: list[dict[str, Any]] = []
 
     async def send(
         self,
@@ -140,6 +141,24 @@ class FakeDiscordAdapter:
             (message_id, collapsed_content, expanded_content)
         )
 
+    async def send_codex_server_request(
+        self,
+        chat_id: str,
+        prompt: str,
+        actions: list[Any],
+        on_action: Any,
+    ) -> FakeSendResult:
+        """Record a Codex component prompt and its response callback."""
+        self.codex_request_prompts.append(
+            {
+                "chat_id": chat_id,
+                "prompt": prompt,
+                "actions": actions,
+                "on_action": on_action,
+            }
+        )
+        return FakeSendResult(str(len(self.codex_request_prompts)))
+
 
 class FakeCodexClient:
     """Return method-specific Codex results and record every request."""
@@ -148,6 +167,7 @@ class FakeCodexClient:
         """Initialize configurable app-server responses for gateway tests."""
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.responses: list[tuple[Any, Any]] = []
+        self.respond_error: Exception | None = None
         self.rejections: list[tuple[Any, int, str]] = []
         self.closed = False
         self.resume_turns: list[dict[str, Any]] = []
@@ -238,6 +258,8 @@ class FakeCodexClient:
 
     async def respond(self, request_id: Any, result: Any) -> None:
         """Record one successful server-request response."""
+        if self.respond_error is not None:
+            raise self.respond_error
         self.responses.append((request_id, result))
 
     async def reject(self, request_id: Any, code: int, message: str) -> None:
@@ -2647,6 +2669,343 @@ async def test_external_prompt_precedes_assistant_stream(
     assert gateway.adapter.edited_metadata[0] == {
         "message_style": "codex_user_prompt"
     }
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_empty_mcp_form_maps_allow_to_empty_content(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """An empty MCP form renders controls and returns an empty object on Allow."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "mcp-1",
+        "mcpServer/elicitation/request",
+        {
+            "threadId": "codex-thread",
+            "mode": "form",
+            "serverName": "node_repl",
+            "message": 'Allow Computer Use to use "TickTick"?',
+            "requestedSchema": {"type": "object", "properties": {}},
+        },
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    assert [action.label for action in prompt["actions"]] == ["Allow", "Deny"]
+    assert await prompt["on_action"](prompt["actions"][0]) is True
+    assert gateway.client.responses == [
+        ("mcp-1", {"action": "accept", "content": {}, "_meta": None})
+    ]
+    assert "discord-thread" not in gateway.pending_server_requests
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_command_approval_maps_session_decision(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A Discord approval button returns the matching Codex decision value."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "approval-1",
+        "item/commandExecution/requestApproval",
+        {"threadId": "codex-thread", "command": "git status"},
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    session_action = next(
+        action for action in prompt["actions"] if action.label == "Approve Session"
+    )
+    assert await prompt["on_action"](session_action) is True
+    assert gateway.client.responses == [
+        ("approval-1", {"decision": "acceptForSession"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_uses_only_available_command_decisions(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Discord presents and accepts only decisions offered by Codex."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "approval-1",
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "codex-thread",
+            "command": "git status",
+            "availableDecisions": ["accept", "decline"],
+        },
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    assert [action.label for action in prompt["actions"]] == [
+        "Approve Once",
+        "Deny",
+    ]
+    response = await gateway.handle_message(FakeMessageEvent("/approve session"))
+    assert response == "Codex offered these responses: `/approve`, `/deny`"
+    assert gateway.client.responses == []
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_mcp_enum_maps_selected_content(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """An MCP enum choice returns an object keyed by the schema field name."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "mcp-enum-1",
+        "mcpServer/elicitation/request",
+        {
+            "threadId": "codex-thread",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "permission": {"type": "string", "enum": ["Allow", "Deny"]}
+                },
+            },
+        },
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    assert [action.label for action in prompt["actions"]] == [
+        "Allow",
+        "Deny",
+        "Decline request",
+    ]
+    assert await prompt["on_action"](prompt["actions"][0]) is True
+    assert gateway.client.responses == [
+        (
+            "mcp-enum-1",
+            {
+                "action": "accept",
+                "content": {"permission": "Allow"},
+                "_meta": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_mcp_titled_choice_maps_const_value(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """An MCP titled choice displays its title and returns its const value."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "mcp-titled-1",
+        "mcpServer/elicitation/request",
+        {
+            "threadId": "codex-thread",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "permission": {
+                        "type": "string",
+                        "oneOf": [
+                            {"const": "allow_once", "title": "Allow Once"},
+                            {"const": "deny", "title": "Deny"},
+                        ],
+                    }
+                },
+            },
+        },
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    assert [action.label for action in prompt["actions"]] == [
+        "Allow Once",
+        "Deny",
+        "Decline request",
+    ]
+    assert await prompt["on_action"](prompt["actions"][0]) is True
+    assert gateway.client.responses == [
+        (
+            "mcp-titled-1",
+            {
+                "action": "accept",
+                "content": {"permission": "allow_once"},
+                "_meta": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_request_omits_null_permission_fields(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A permission grant excludes null fields from the Codex response."""
+    gateway.pending_server_requests["discord-thread"] = [
+        PendingCodexServerRequest(
+            request_id="permission-1",
+            method="item/permissions/requestApproval",
+            params={
+                "permissions": {
+                    "network": None,
+                    "fileSystem": {"read": ["/tmp/project"]},
+                }
+            },
+        )
+    ]
+
+    response = await gateway.handle_message(FakeMessageEvent("/approve"))
+
+    assert response == "Codex request resolved with `approve`."
+    assert gateway.client.responses == [
+        (
+            "permission-1",
+            {
+                "permissions": {"fileSystem": {"read": ["/tmp/project"]}},
+                "scope": "turn",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_single_question_maps_choice_answer(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A single Codex question maps each declared option to a Discord button."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    await gateway.handle_server_request(
+        "question-1",
+        "item/tool/requestUserInput",
+        {
+            "threadId": "codex-thread",
+            "questions": [
+                {
+                    "id": "format",
+                    "header": "Format",
+                    "question": "Choose the response format.",
+                    "options": [
+                        {"label": "Compact", "description": "One paragraph."},
+                        {"label": "Detailed", "description": "Several sections."},
+                    ],
+                }
+            ],
+        },
+    )
+
+    prompt = gateway.adapter.codex_request_prompts[0]
+    assert [action.label for action in prompt["actions"]] == [
+        "Compact",
+        "Detailed",
+    ]
+    assert await prompt["on_action"](prompt["actions"][1]) is True
+    assert gateway.client.responses == [
+        (
+            "question-1",
+            {"answers": {"format": {"answers": ["Detailed"]}}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_server_request_action_stale_request_preserves_queue(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A disconnected socket's button cannot resolve a same-id replacement."""
+    stale_request = PendingCodexServerRequest(
+        request_id="approval-1",
+        method="item/fileChange/requestApproval",
+        params={"threadId": "codex-thread"},
+    )
+    gateway.pending_server_requests["discord-thread"] = [stale_request]
+    await gateway._clear_socket_scoped_state()
+    replacement_request = PendingCodexServerRequest(
+        request_id="approval-1",
+        method="item/fileChange/requestApproval",
+        params={"threadId": "codex-thread"},
+    )
+    gateway.pending_server_requests["discord-thread"] = [replacement_request]
+    stale_action = gateway._server_request_actions(
+        "item/fileChange/requestApproval", {}
+    )[0]
+
+    resolved = await gateway._resolve_server_request_action(
+        "discord-thread", stale_request, stale_action
+    )
+
+    assert resolved is False
+    assert gateway.client.responses == []
+    assert gateway.pending_server_requests["discord-thread"][0] is replacement_request
+
+
+@pytest.mark.asyncio
+async def test_resolve_server_request_action_failure_keeps_request_for_retry(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A failed Codex response write leaves the same request pending."""
+    pending_request = PendingCodexServerRequest(
+        request_id="mcp-1",
+        method="mcpServer/elicitation/request",
+        params={"mode": "form", "requestedSchema": {"properties": {}}},
+    )
+    gateway.pending_server_requests["discord-thread"] = [pending_request]
+    allow_action = gateway._server_request_actions(
+        pending_request.method, pending_request.params
+    )[0]
+    gateway.client.respond_error = RuntimeError("socket unavailable")
+
+    with pytest.raises(RuntimeError, match="socket unavailable"):
+        await gateway._resolve_server_request_action(
+            "discord-thread", pending_request, allow_action
+        )
+
+    assert gateway.pending_server_requests["discord-thread"][0] is pending_request
+    gateway.client.respond_error = None
+    assert await gateway._resolve_server_request_action(
+        "discord-thread", pending_request, allow_action
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_server_request_component_failure_sends_text_fallback(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A failed interactive delivery sends the complete prompt as text."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+
+    async def unavailable_components(**_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(success=False, error="components unavailable")
+
+    gateway.adapter.send_codex_server_request = unavailable_components
+    await gateway.handle_server_request(
+        "approval-1",
+        "item/fileChange/requestApproval",
+        {"threadId": "codex-thread"},
+    )
+
+    assert gateway.adapter.sent == [
+        (
+            "discord-thread",
+            "⚠️ **Codex requests file-change approval**\n"
+            "Reply `/approve`, `/approve session`, or `/deny`.",
+        )
+    ]
 
 
 @pytest.mark.asyncio
