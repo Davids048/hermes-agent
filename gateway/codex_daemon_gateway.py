@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 _INITIALIZE_TIMEOUT_SECONDS = 15.0
 _REQUEST_TIMEOUT_SECONDS = 45.0
 _RECONNECT_MAX_DELAY_SECONDS = 30.0
+_ROLLOUT_RETRY_INITIAL_DELAY_SECONDS = 0.5
+_ROLLOUT_RETRY_MAX_DELAY_SECONDS = 30.0
 _STREAM_EDIT_INTERVAL_SECONDS = 0.75
 _HISTORY_PAGE_SIZE = 100
 _UUID_PATTERN = re.compile(
@@ -46,6 +48,12 @@ class CodexRpcError(RuntimeError):
         self.code = code
         self.message = message
         self.data = data
+
+
+def _is_missing_rollout_error(error: CodexRpcError, thread_id: str) -> bool:
+    """Match the transient resume error emitted before a rollout is durable."""
+    expected = f"no rollout found for thread id {thread_id}"
+    return error.message == expected
 
 
 @dataclass(frozen=True)
@@ -621,7 +629,8 @@ class DiscordCodexGateway:
         self._pending_gateway_thread_starts = 0
         self._gateway_started_thread_ids: set[str] = set()
         self._deferred_started_threads: dict[str, dict[str, Any]] = {}
-        self._creating_discord_thread_ids: set[str] = set()
+        self._provisional_thread_tasks: dict[str, asyncio.Task[None]] = {}
+        self._awaiting_rollout_thread_ids: set[str] = set()
         self._history_syncing_thread_ids: set[str] = set()
         self._queued_history_notifications: dict[
             str, list[tuple[str, dict[str, Any]]]
@@ -643,7 +652,8 @@ class DiscordCodexGateway:
         )
 
     async def stop(self) -> None:
-        """Finish stream-edit tasks and close the daemon connection."""
+        """Cancel delivery tasks and close the daemon connection."""
+        await self._cancel_all_provisional_threads()
         tasks = [
             stream.flush_task
             for stream in self.stream_messages.values()
@@ -659,9 +669,11 @@ class DiscordCodexGateway:
     async def handle_message(self, event: Any) -> str:
         """Route one authorized Discord message to a Codex task or command."""
         chat_id = str(event.source.chat_id)
+        command = event.get_command()
+        if command and command.lower() == "refresh":
+            return await self._refresh_task(chat_id)
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            command = event.get_command()
             if command:
                 return await self._handle_command(event, command.lower())
             pending = self.pending_server_requests.get(chat_id, [])
@@ -879,6 +891,31 @@ class DiscordCodexGateway:
             f"Directory: `{binding.cwd}`\nState: {state}"
         )
 
+    async def _refresh_task(self, chat_id: str) -> str:
+        """Resubscribe one mapped task and replay its missing durable history."""
+        binding = self.bindings.bindings.get(chat_id)
+        if binding is None:
+            return "This Discord thread is not attached to a Codex task."
+        try:
+            result = await self._resume_and_sync_binding(binding)
+        except CodexRpcError as error:
+            if _is_missing_rollout_error(error, binding.codex_thread_id):
+                return (
+                    "Codex has not written this task's rollout yet. Try `/refresh` "
+                    "again after the first prompt starts."
+                )
+            return f"Could not refresh Codex task `{binding.codex_thread_id}`: {error.message}"
+        thread = result.get("thread", {}) if isinstance(result, dict) else {}
+        if isinstance(thread, dict) and (thread.get("name") or thread.get("preview")):
+            title = self._task_title(thread)
+            if title != binding.title:
+                await self._rename_bound_task(binding.codex_thread_id, title)
+                binding = self.bindings.bindings.get(chat_id, binding)
+        binding.cwd = str(result.get("cwd") or thread.get("cwd") or binding.cwd)
+        self.bindings.bind(binding)
+        status = await self._status_text(chat_id)
+        return f"Refreshed Codex task `{binding.codex_thread_id}`.\n{status}"
+
     async def _interrupt_task(self, chat_id: str) -> str:
         """Interrupt the exact active Codex turn attached to a Discord thread."""
         binding = self.bindings.bindings.get(chat_id)
@@ -1007,6 +1044,7 @@ class DiscordCodexGateway:
 
     async def _clear_socket_scoped_state(self) -> None:
         """Discard request and stream identities that belonged to a replaced socket."""
+        await self._cancel_all_provisional_threads()
         tasks = [
             stream.flush_task
             for stream in self.stream_messages.values()
@@ -1177,6 +1215,11 @@ class DiscordCodexGateway:
         )
         if not thread_id:
             return
+        if method == "thread/closed":
+            self._deferred_started_threads.pop(thread_id, None)
+            await self._cancel_provisional_thread(thread_id)
+            self.active_turns.pop(thread_id, None)
+            return
         if thread_id in self._history_syncing_thread_ids:
             self._queued_history_notifications.setdefault(thread_id, []).append(
                 (method, params)
@@ -1284,7 +1327,7 @@ class DiscordCodexGateway:
                 await self.adapter.send(chat_id, f"⚠️ **Codex error:** {message}{retry}")
 
     async def _handle_started_thread(self, thread: dict[str, Any]) -> None:
-        """Bind an external Codex task to a newly created Discord thread."""
+        """Start one provisional mirror task for an external Codex task."""
         thread_id = str(thread.get("id") or "")
         if not thread_id or self.bindings.chats_for_codex_thread(thread_id):
             return
@@ -1293,7 +1336,16 @@ class DiscordCodexGateway:
         if self._pending_gateway_thread_starts:
             self._deferred_started_threads[thread_id] = thread
             return
-        await self._create_discord_thread_for_task(thread)
+        if thread_id in self._provisional_thread_tasks:
+            return
+        first_attempt_finished = asyncio.Event()
+        self._awaiting_rollout_thread_ids.add(thread_id)
+        task = asyncio.create_task(
+            self._mirror_external_thread(thread, first_attempt_finished),
+            name=f"codex-rollout-{thread_id}",
+        )
+        self._provisional_thread_tasks[thread_id] = task
+        await first_attempt_finished.wait()
 
     async def _drain_deferred_started_threads(self) -> None:
         """Process external task notifications after local starts have identities."""
@@ -1303,36 +1355,130 @@ class DiscordCodexGateway:
             thread_id = str(thread.get("id") or "")
             if thread_id in self._gateway_started_thread_ids:
                 continue
-            await self._create_discord_thread_for_task(thread)
+            await self._handle_started_thread(thread)
 
-    async def _create_discord_thread_for_task(self, thread: dict[str, Any]) -> None:
-        """Create, persist, and subscribe one external Codex task mapping."""
+    async def _mirror_external_thread(
+        self,
+        thread: dict[str, Any],
+        first_attempt_finished: asyncio.Event,
+    ) -> None:
+        """Wait for rollout durability, then create and synchronize Discord."""
         thread_id = str(thread.get("id") or "")
-        if (
-            self.bindings.chats_for_codex_thread(thread_id)
-            or thread_id in self._creating_discord_thread_ids
-        ):
+        provisional = CodexTaskBinding(
+            discord_chat_id="",
+            codex_thread_id=thread_id,
+            cwd=str(thread.get("cwd") or self.settings.default_cwd),
+            title=self._task_title(thread),
+            parent_chat_id=self.settings.parent_chat_id,
+        )
+        retry_delay = _ROLLOUT_RETRY_INITIAL_DELAY_SECONDS
+        binding: Optional[CodexTaskBinding] = None
+        self._history_syncing_thread_ids.add(thread_id)
+        try:
+            while True:
+                try:
+                    await self._resume_binding(provisional)
+                except CodexRpcError as error:
+                    if not _is_missing_rollout_error(error, thread_id):
+                        raise
+                    if not first_attempt_finished.is_set():
+                        logger.info(
+                            "Waiting for Codex task %s to write its rollout",
+                            thread_id,
+                        )
+                        first_attempt_finished.set()
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(
+                        max(retry_delay * 2, _ROLLOUT_RETRY_INITIAL_DELAY_SECONDS),
+                        _ROLLOUT_RETRY_MAX_DELAY_SECONDS,
+                    )
+                    continue
+                self._awaiting_rollout_thread_ids.discard(thread_id)
+                binding = await self._create_discord_thread_for_task(thread)
+                if binding is not None:
+                    await self._sync_task_history(binding)
+                    logger.info(
+                        "Synchronized Codex task %s after rollout became available",
+                        thread_id,
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not mirror external Codex task %s", thread_id)
+        finally:
+            try:
+                if binding is not None:
+                    await self._finish_history_sync(thread_id)
+                else:
+                    self._discard_provisional_thread_state(thread_id)
+            except Exception:
+                self._history_syncing_thread_ids.discard(thread_id)
+                self._queued_history_notifications.pop(thread_id, None)
+                logger.exception(
+                    "Could not finish Discord history synchronization for Codex task %s",
+                    thread_id,
+                )
+            finally:
+                if not first_attempt_finished.is_set():
+                    first_attempt_finished.set()
+                current_task = asyncio.current_task()
+                if self._provisional_thread_tasks.get(thread_id) is current_task:
+                    self._provisional_thread_tasks.pop(thread_id, None)
+                self._awaiting_rollout_thread_ids.discard(thread_id)
+
+    async def _cancel_provisional_thread(self, thread_id: str) -> None:
+        """Cancel one provisional mirror after Codex closes the task."""
+        if thread_id not in self._awaiting_rollout_thread_ids:
             return
+        task = self._provisional_thread_tasks.get(thread_id)
+        if task is None:
+            return
+        task.cancel()
+        if task is not asyncio.current_task():
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _cancel_all_provisional_threads(self) -> None:
+        """Cancel every rollout retry before replacing the socket or stopping."""
+        tasks = list(self._provisional_thread_tasks.values())
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    def _discard_provisional_thread_state(self, thread_id: str) -> None:
+        """Discard queued events for a task that never gained a Discord mapping."""
+        self._history_syncing_thread_ids.discard(thread_id)
+        self._queued_history_notifications.pop(thread_id, None)
+        self.active_turns.pop(thread_id, None)
+        self._awaiting_rollout_thread_ids.discard(thread_id)
+
+    async def _create_discord_thread_for_task(
+        self, thread: dict[str, Any]
+    ) -> Optional[CodexTaskBinding]:
+        """Create and persist Discord after an external task becomes resumable."""
+        thread_id = str(thread.get("id") or "")
+        existing_chat_ids = self.bindings.chats_for_codex_thread(thread_id)
+        if existing_chat_ids:
+            return self.bindings.bindings.get(existing_chat_ids[0])
         parent_chat_id = self.settings.parent_chat_id
         if not thread_id or not parent_chat_id:
             logger.warning(
                 "Cannot create a Discord thread for Codex task %s without parent_chat_id",
                 thread_id,
             )
-            return
+            return None
         title = self._task_title(thread)
-        self._creating_discord_thread_ids.add(thread_id)
-        try:
-            discord_chat_id = await self.adapter.create_codex_task_thread(
-                parent_chat_id,
-                title,
-                member_user_ids=self.settings.member_user_ids,
-            )
-        finally:
-            self._creating_discord_thread_ids.discard(thread_id)
+        discord_chat_id = await self.adapter.create_codex_task_thread(
+            parent_chat_id,
+            title,
+            member_user_ids=self.settings.member_user_ids,
+        )
         if not discord_chat_id:
             logger.error("Could not create a Discord thread for Codex task %s", thread_id)
-            return
+            return None
         binding = CodexTaskBinding(
             discord_chat_id=str(discord_chat_id),
             codex_thread_id=thread_id,
@@ -1341,14 +1487,7 @@ class DiscordCodexGateway:
             parent_chat_id=parent_chat_id,
         )
         self.bindings.bind(binding)
-        try:
-            await self._resume_and_sync_binding(binding)
-        except Exception:
-            logger.exception(
-                "Created Discord thread %s but could not synchronize Codex task %s",
-                discord_chat_id,
-                thread_id,
-            )
+        return binding
 
     async def _rename_untitled_task(self, thread_id: str, prompt: str) -> None:
         """Use the first terminal prompt as the title of an unnamed Codex task."""
@@ -2139,6 +2278,7 @@ class DiscordCodexGateway:
             "- `/resume TASK_ID-or-title` — search for and attach a task\n"
             "- `/new [/absolute/cwd]` — attach a fresh task\n"
             "- `/status` — show the attached task and live turn\n"
+            "- `/refresh` — resubscribe and replay missing task history\n"
             "- `/stop` — interrupt the active Codex turn\n"
             "- `/approve`, `/approve session`, `/deny` — answer approvals\n\n"
             "A normal message starts or steers the attached Codex task. "

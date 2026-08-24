@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from gateway.codex_daemon_gateway import (
     CodexGatewaySettings,
     CodexItemDelivery,
+    CodexRpcError,
     CodexTaskBinding,
     CodexTaskBindingStore,
     DiscordCodexGateway,
@@ -36,6 +38,8 @@ class FakeDiscordAdapter:
         self.sent_metadata: list[dict[str, Any] | None] = []
         self.edited_metadata: list[dict[str, Any] | None] = []
         self.created_task_threads: list[tuple[str, str]] = []
+        self.create_task_thread_started_event: asyncio.Event | None = None
+        self.create_task_thread_wait_event: asyncio.Event | None = None
         self.renamed_threads: list[tuple[str, str, str | None]] = []
         self.registered_activities: list[tuple[str, str, str]] = []
 
@@ -75,6 +79,10 @@ class FakeDiscordAdapter:
         member_user_ids: tuple[str, ...] = (),
     ) -> str:
         """Record one Discord thread created for an external Codex task."""
+        if self.create_task_thread_started_event is not None:
+            self.create_task_thread_started_event.set()
+        if self.create_task_thread_wait_event is not None:
+            await self.create_task_thread_wait_event.wait()
         self.created_task_threads.append((parent_chat_id, name))
         self.created_task_thread_members = member_user_ids
         return f"discord-task-{len(self.created_task_threads)}"
@@ -116,6 +124,8 @@ class FakeCodexClient:
         self.history_pages: dict[str | None, dict[str, Any]] = {}
         self.history_list_callback = None
         self.resume_error: Exception | None = None
+        self.resume_errors: list[Exception | None] = []
+        self.resume_wait_event: asyncio.Event | None = None
         self.loaded_thread_ids: list[str] = []
         self.loaded_pages: dict[str | None, dict[str, Any]] = {}
         self.read_threads: dict[str, dict[str, Any]] = {}
@@ -147,8 +157,14 @@ class FakeCodexClient:
         if method == "turn/interrupt":
             return {}
         if method == "thread/resume":
+            if self.resume_errors:
+                resume_error = self.resume_errors.pop(0)
+                if resume_error is not None:
+                    raise resume_error
             if self.resume_error is not None:
                 raise self.resume_error
+            if self.resume_wait_event is not None:
+                await self.resume_wait_event.wait()
             return {
                 "thread": {"id": params["threadId"], "name": "Mapped task"},
                 "cwd": "/tmp/project",
@@ -391,6 +407,284 @@ async def test_external_started_task_creates_discord_thread_and_mapping(
         "thread/resume",
         "thread/turns/list",
     ]
+
+
+@pytest.mark.asyncio
+async def test_external_started_task_waits_for_rollout_before_discord_thread(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient missing rollout delays Discord creation until resume works."""
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._ROLLOUT_RETRY_INITIAL_DELAY_SECONDS", 0
+    )
+    gateway.client.resume_errors = [
+        CodexRpcError(
+            -32603,
+            "no rollout found for thread id external-thread",
+        )
+    ]
+    gateway.client.resume_wait_event = asyncio.Event()
+
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "inspect the cluster",
+                "cwd": "/tmp/cluster",
+                "source": "vscode",
+            }
+        },
+    )
+
+    assert gateway.adapter.created_task_threads == []
+    retry_task = gateway._provisional_thread_tasks["external-thread"]
+    gateway.client.resume_wait_event.set()
+    await asyncio.wait_for(retry_task, timeout=1)
+
+    assert gateway.adapter.created_task_threads == [
+        ("parent-channel", "inspect the cluster")
+    ]
+    assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
+        "external-thread"
+    )
+    assert [
+        method for method, _ in gateway.client.requests if method == "thread/resume"
+    ] == ["thread/resume", "thread/resume"]
+
+
+@pytest.mark.asyncio
+async def test_closed_external_task_cancels_missing_rollout_retry(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Closing a provisional Codex task leaves no Discord thread or retry."""
+    gateway.client.resume_error = CodexRpcError(
+        -32603,
+        "no rollout found for thread id external-thread",
+    )
+
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "",
+                "cwd": "/tmp/cluster",
+                "source": "cli",
+            }
+        },
+    )
+    await gateway.handle_notification(
+        "thread/closed",
+        {"threadId": "external-thread"},
+    )
+
+    assert gateway.adapter.created_task_threads == []
+    assert gateway.bindings.bindings == {}
+    assert "external-thread" not in gateway._provisional_thread_tasks
+    assert "external-thread" not in gateway._awaiting_rollout_thread_ids
+    assert "external-thread" not in gateway._history_syncing_thread_ids
+    assert "external-thread" not in gateway._queued_history_notifications
+
+
+@pytest.mark.asyncio
+async def test_closed_resumable_task_finishes_discord_thread_creation(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing after rollout durability cannot orphan Discord thread creation."""
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._ROLLOUT_RETRY_INITIAL_DELAY_SECONDS", 0
+    )
+    gateway.client.resume_errors = [
+        CodexRpcError(
+            -32603,
+            "no rollout found for thread id external-thread",
+        )
+    ]
+    gateway.adapter.create_task_thread_started_event = asyncio.Event()
+    gateway.adapter.create_task_thread_wait_event = asyncio.Event()
+
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "inspect the cluster",
+                "cwd": "/tmp/cluster",
+                "source": "cli",
+            }
+        },
+    )
+    mirror_task = gateway._provisional_thread_tasks["external-thread"]
+    await asyncio.wait_for(
+        gateway.adapter.create_task_thread_started_event.wait(),
+        timeout=1,
+    )
+
+    await gateway.handle_notification(
+        "thread/closed",
+        {"threadId": "external-thread"},
+    )
+    assert mirror_task.cancelled() is False
+    gateway.adapter.create_task_thread_wait_event.set()
+    await asyncio.wait_for(mirror_task, timeout=1)
+
+    assert gateway.adapter.created_task_threads == [
+        ("parent-channel", "inspect the cluster")
+    ]
+    assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
+        "external-thread"
+    )
+    assert "external-thread" not in gateway._awaiting_rollout_thread_ids
+
+
+@pytest.mark.asyncio
+async def test_closed_established_task_preserves_discord_mapping(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Closing a resumable Codex task retains its established Discord thread."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway.active_turns["codex-thread"] = "active-turn"
+
+    await gateway.handle_notification(
+        "thread/closed",
+        {"threadId": "codex-thread"},
+    )
+
+    assert gateway.bindings.bindings["discord-thread"].codex_thread_id == (
+        "codex-thread"
+    )
+    assert "codex-thread" not in gateway.active_turns
+
+
+@pytest.mark.asyncio
+async def test_closed_deferred_task_never_starts_a_rollout_retry(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A close event removes a task deferred behind a Discord-originated start."""
+    gateway._pending_gateway_thread_starts = 1
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "",
+                "cwd": "/tmp/cluster",
+                "source": "cli",
+            }
+        },
+    )
+
+    await gateway.handle_notification(
+        "thread/closed",
+        {"threadId": "external-thread"},
+    )
+    gateway._pending_gateway_thread_starts = 0
+    await gateway._drain_deferred_started_threads()
+
+    assert gateway.adapter.created_task_threads == []
+    assert gateway.client.requests == []
+    assert gateway._provisional_thread_tasks == {}
+    assert gateway._awaiting_rollout_thread_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_external_started_task_does_not_retry_other_resume_errors(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """A non-rollout RPC error ends provisional mirroring after one attempt."""
+    gateway.client.resume_error = CodexRpcError(
+        -32603,
+        "No rollout found for thread id external-thread",
+    )
+
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "inspect the cluster",
+                "cwd": "/tmp/cluster",
+                "source": "cli",
+            }
+        },
+    )
+
+    assert gateway.adapter.created_task_threads == []
+    assert "external-thread" not in gateway._provisional_thread_tasks
+    assert "external-thread" not in gateway._awaiting_rollout_thread_ids
+    assert [
+        method for method, _ in gateway.client.requests if method == "thread/resume"
+    ] == ["thread/resume"]
+
+
+@pytest.mark.asyncio
+async def test_external_started_task_unblocks_when_history_cleanup_fails(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup failure cannot retain a provisional task or block notifications."""
+    async def fail_history_cleanup(_thread_id: str) -> None:
+        """Simulate a Discord delivery failure during queued-event replay."""
+        raise RuntimeError("history cleanup failed")
+
+    monkeypatch.setattr(gateway, "_finish_history_sync", fail_history_cleanup)
+
+    await asyncio.wait_for(
+        gateway.handle_notification(
+            "thread/started",
+            {
+                "thread": {
+                    "id": "external-thread",
+                    "preview": "inspect the cluster",
+                    "cwd": "/tmp/cluster",
+                    "source": "cli",
+                }
+            },
+        ),
+        timeout=1,
+    )
+
+    assert gateway.adapter.created_task_threads == [
+        ("parent-channel", "inspect the cluster")
+    ]
+    assert "external-thread" not in gateway._provisional_thread_tasks
+    assert "external-thread" not in gateway._awaiting_rollout_thread_ids
+    assert "external-thread" not in gateway._history_syncing_thread_ids
+    assert "external-thread" not in gateway._queued_history_notifications
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_cancels_missing_rollout_retry(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Gateway shutdown cancels rollout polling before closing the client."""
+    gateway.client.resume_error = CodexRpcError(
+        -32603,
+        "no rollout found for thread id external-thread",
+    )
+    await gateway.handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "external-thread",
+                "preview": "",
+                "cwd": "/tmp/cluster",
+                "source": "cli",
+            }
+        },
+    )
+
+    await gateway.stop()
+
+    assert gateway.client.closed is True
+    assert gateway._provisional_thread_tasks == {}
+    assert gateway._awaiting_rollout_thread_ids == set()
+    assert "external-thread" not in gateway._history_syncing_thread_ids
 
 
 @pytest.mark.asyncio
@@ -1391,6 +1685,81 @@ async def test_resume_without_selector_lists_recent_codex_tasks(
 
     assert "Search result" in response
     assert gateway.client.requests[-1][0] == "thread/list"
+
+
+@pytest.mark.asyncio
+async def test_refresh_replays_each_missing_history_item_once(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Repeated refreshes resubscribe without duplicating delivered history."""
+    gateway.bindings.bind(
+        CodexTaskBinding(
+            "discord-thread",
+            "codex-thread",
+            "/tmp/original",
+            title="Previous task",
+        )
+    )
+    gateway.client.history_turns = [
+        {
+            "id": "completed-turn",
+            "status": "completed",
+            "items": [
+                {
+                    "id": "codex-response",
+                    "type": "agentMessage",
+                    "text": "Recovered response.",
+                }
+            ],
+        }
+    ]
+
+    first_response = await gateway.handle_message(FakeMessageEvent("/refresh"))
+    second_response = await gateway.handle_message(FakeMessageEvent("/refresh"))
+
+    assert first_response.startswith("Refreshed Codex task `codex-thread`.")
+    assert second_response.startswith("Refreshed Codex task `codex-thread`.")
+    assert "State: idle" in second_response
+    assert gateway.adapter.sent == [("discord-thread", "Recovered response.")]
+    assert gateway.bindings.bindings["discord-thread"].cwd == "/tmp/project"
+    assert gateway.bindings.bindings["discord-thread"].title == "Mapped task"
+    assert gateway.adapter.renamed_threads == [
+        ("discord-thread", "Mapped task", "Previous task")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_missing_rollout_without_detaching_task(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Refresh explains a transient rollout gap and preserves the mapping."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    gateway.client.resume_error = CodexRpcError(
+        -32603,
+        "no rollout found for thread id codex-thread",
+    )
+
+    response = await gateway.handle_message(FakeMessageEvent("/refresh"))
+
+    assert response == (
+        "Codex has not written this task's rollout yet. Try `/refresh` again after "
+        "the first prompt starts."
+    )
+    assert gateway.bindings.bindings["discord-thread"].codex_thread_id == (
+        "codex-thread"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_requires_an_attached_codex_task(
+    gateway: DiscordCodexGateway,
+) -> None:
+    """Refresh gives an actionable response outside a mapped Discord thread."""
+    response = await gateway.handle_message(FakeMessageEvent("/refresh"))
+
+    assert response == "This Discord thread is not attached to a Codex task."
 
 
 @pytest.mark.asyncio
