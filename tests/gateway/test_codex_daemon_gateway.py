@@ -329,7 +329,7 @@ def test_binding_store_round_trips_mapping(tmp_path: Path) -> None:
             codex_thread_id="codex-1",
             cwd="/tmp/project",
             title="Training run",
-            discord_title="✅ Training run | tmp/project | codex-1",
+            discord_title="✅ Training run | tmp/project",
             item_deliveries={
                 "agent-item": CodexItemDelivery(
                     discord_message_id="discord-message",
@@ -345,7 +345,7 @@ def test_binding_store_round_trips_mapping(tmp_path: Path) -> None:
     assert second.bindings["discord-1"].codex_thread_id == "codex-1"
     assert second.bindings["discord-1"].title == "Training run"
     assert second.bindings["discord-1"].discord_title == (
-        "✅ Training run | tmp/project | codex-1"
+        "✅ Training run | tmp/project"
     )
     assert second.bindings["discord-1"].item_deliveries["agent-item"] == (
         CodexItemDelivery(discord_message_id="discord-message", final=True)
@@ -364,39 +364,31 @@ def test_binding_store_keeps_one_discord_thread_per_codex_task(tmp_path: Path) -
     assert set(store.bindings) == {"discord-2"}
 
 
-def test_discord_thread_title_three_components() -> None:
-    """A Discord task title includes its name, directory, and full session id."""
-    session_id = "11111111-1111-1111-1111-111111111111"
-
+def test_discord_thread_title_two_components() -> None:
+    """A Discord task title includes its status, name, and directory."""
     title = _discord_thread_title(
         "Fix sync",
         "/mnt/zfs/home/junda.su/codes/new_training",
-        session_id,
     )
 
-    assert title == f"✅ Fix sync | codes/new_training | {session_id}"
+    assert title == "✅ Fix sync | codes/new_training"
     assert _discord_thread_title(
         "Fix sync",
         "/mnt/zfs/home/junda.su/codes/new_training",
-        session_id,
         working=True,
-    ) == f"⏳ Fix sync | codes/new_training | {session_id}"
+    ) == "⏳ Fix sync | codes/new_training"
 
 
-def test_discord_thread_title_long_components_preserve_session_id() -> None:
-    """Title truncation preserves three components and the full session id."""
-    session_id = "11111111-1111-1111-1111-111111111111"
-
+def test_discord_thread_title_long_components_fit_discord_limit() -> None:
+    """Title truncation preserves the name and directory components."""
     title = _discord_thread_title(
         "😀" * 80,
         "/very-long-parent-directory/very-long-working-directory",
-        session_id,
     )
 
-    status_and_name, directory, rendered_session_id = title.split(" | ")
+    status_and_name, directory = title.split(" | ")
     assert status_and_name.startswith("✅ ")
     assert directory.endswith("very-long-working-directory")
-    assert rendered_session_id == session_id
     assert utf16_len(title) <= 80
 
 
@@ -443,12 +435,10 @@ async def test_first_message_creates_codex_task_and_starts_turn(
     idle_title = _discord_thread_title(
         "test Discord thread",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     working_title = _discord_thread_title(
         "test Discord thread",
         str(gateway.settings.default_cwd),
-        "thread-created",
         working=True,
     )
     assert binding.codex_thread_id == "thread-created"
@@ -483,12 +473,10 @@ async def test_create_task_for_event_uses_raw_discord_name_guard(
     idle_title = _discord_thread_title(
         "Test server / #m7 / raw thread name",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     working_title = _discord_thread_title(
         "Test server / #m7 / raw thread name",
         str(gateway.settings.default_cwd),
-        "thread-created",
         working=True,
     )
     assert gateway.adapter.renamed_threads == [
@@ -521,7 +509,7 @@ async def test_external_started_task_creates_discord_thread_and_mapping(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | external-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert gateway.adapter.created_task_thread_members == ("discord-user",)
@@ -529,7 +517,7 @@ async def test_external_started_task_creates_discord_thread_and_mapping(
     assert binding.codex_thread_id == "external-thread"
     assert binding.cwd == "/tmp/project"
     assert binding.title == "Mapped task"
-    assert binding.discord_title == "✅ Mapped task | tmp/project | external-thread"
+    assert binding.discord_title == "✅ Mapped task | tmp/project"
     assert [method for method, _ in gateway.client.requests[-2:]] == [
         "thread/resume",
         "thread/turns/list",
@@ -573,7 +561,7 @@ async def test_external_started_task_uses_resumed_name_and_directory(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "⏳ Current task name | current/project | external-thread",
+            "⏳ Current task name | current/project",
         )
     ]
     binding = gateway.bindings.bindings["discord-task-1"]
@@ -627,7 +615,7 @@ async def test_external_started_task_merges_partial_resume_metadata(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            f"✅ {expected_name} | current/project | external-thread",
+            f"✅ {expected_name} | current/project",
         )
     ]
 
@@ -669,7 +657,7 @@ async def test_external_started_task_waits_for_rollout_before_discord_thread(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | external-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
@@ -760,7 +748,7 @@ async def test_closed_resumable_task_finishes_discord_thread_creation(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | external-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
@@ -881,7 +869,7 @@ async def test_external_started_task_unblocks_when_history_cleanup_fails(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | external-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert "external-thread" not in gateway._provisional_thread_tasks
@@ -940,7 +928,7 @@ async def test_external_started_subagent_task_creates_discord_thread(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | subagent-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
@@ -1201,21 +1189,21 @@ async def test_first_external_prompt_names_an_untitled_discord_thread(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-task-1",
-            "✅ inspect the cluster | tmp/cluster | external-thread",
-            "✅ Untitled task | tmp/cluster | external-thread",
+            "✅ inspect the cluster | tmp/cluster",
+            "✅ Untitled task | tmp/cluster",
         )
     ]
     assert gateway.bindings.bindings["discord-task-1"].title == "inspect the cluster"
     assert gateway.bindings.bindings["discord-task-1"].discord_title == (
-        "✅ inspect the cluster | tmp/cluster | external-thread"
+        "✅ inspect the cluster | tmp/cluster"
     )
 
 
 @pytest.mark.asyncio
-async def test_handle_notification_thread_name_updated_renders_full_title(
+async def test_handle_notification_thread_name_updated_omits_session_id(
     gateway: DiscordCodexGateway,
 ) -> None:
-    """A Codex semantic name update preserves directory and session identity."""
+    """A Codex semantic name update renders only the name and directory."""
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1234,13 +1222,13 @@ async def test_handle_notification_thread_name_updated_renders_full_title(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            "✅ Renamed task | tmp/project | codex-thread",
+            "✅ Renamed task | tmp/project",
             "✅ Original name | tmp/project | codex-thread",
         )
     ]
     assert gateway.bindings.bindings["discord-thread"].title == "Renamed task"
     assert gateway.bindings.bindings["discord-thread"].discord_title == (
-        "✅ Renamed task | tmp/project | codex-thread"
+        "✅ Renamed task | tmp/project"
     )
 
 
@@ -1249,8 +1237,8 @@ async def test_turn_lifecycle_updates_discord_title_status(
     gateway: DiscordCodexGateway,
 ) -> None:
     """An active turn uses an hourglass and a completed turn uses a check mark."""
-    idle_title = "✅ Task name | tmp/project | codex-thread"
-    working_title = "⏳ Task name | tmp/project | codex-thread"
+    idle_title = "✅ Task name | tmp/project"
+    working_title = "⏳ Task name | tmp/project"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1288,7 +1276,7 @@ async def test_name_updates_preserve_guard_after_manual_discord_rename(
     gateway: DiscordCodexGateway,
 ) -> None:
     """A manual Discord title keeps blocking later Codex-driven renames."""
-    original_discord_title = "✅ Original name | tmp/project | codex-thread"
+    original_discord_title = "✅ Original name | tmp/project"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1312,12 +1300,12 @@ async def test_name_updates_preserve_guard_after_manual_discord_rename(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            "✅ First Codex name | tmp/project | codex-thread",
+            "✅ First Codex name | tmp/project",
             original_discord_title,
         ),
         (
             "discord-thread",
-            "✅ Second Codex name | tmp/project | codex-thread",
+            "✅ Second Codex name | tmp/project",
             original_discord_title,
         ),
     ]
@@ -1372,7 +1360,7 @@ async def test_reconnect_discovers_loaded_unbound_task(
     assert gateway.adapter.created_task_threads == [
         (
             "parent-channel",
-            "✅ Mapped task | tmp/project | external-thread",
+            "✅ Mapped task | tmp/project",
         )
     ]
     assert gateway.bindings.bindings["discord-task-1"].codex_thread_id == (
@@ -1399,14 +1387,14 @@ async def test_resume_bound_tasks_migrates_legacy_discord_title(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            "✅ Mapped task | tmp/project | codex-thread",
+            "✅ Mapped task | tmp/project",
             "Previous task",
         )
     ]
     binding = gateway.bindings.bindings["discord-thread"]
     assert binding.title == "Mapped task"
     assert binding.cwd == "/tmp/project"
-    assert binding.discord_title == "✅ Mapped task | tmp/project | codex-thread"
+    assert binding.discord_title == "✅ Mapped task | tmp/project"
 
 
 @pytest.mark.asyncio
@@ -1433,12 +1421,12 @@ async def test_resume_bound_tasks_preserves_manually_changed_legacy_title(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            "✅ Mapped task | tmp/project | codex-thread",
+            "✅ Mapped task | tmp/project",
             "Previous task",
         ),
         (
             "discord-thread",
-            "✅ Later task name | tmp/project | codex-thread",
+            "✅ Later task name | tmp/project",
             "Previous task",
         ),
     ]
@@ -1474,8 +1462,8 @@ async def test_reconnect_discovers_every_loaded_task_page(
     await gateway._resume_bound_tasks()
 
     assert gateway.adapter.created_task_threads == [
-        ("parent-channel", "✅ Mapped task | tmp/project | external-one"),
-        ("parent-channel", "✅ Mapped task | tmp/project | external-two"),
+        ("parent-channel", "✅ Mapped task | tmp/project"),
+        ("parent-channel", "✅ Mapped task | tmp/project"),
     ]
 
 
@@ -1498,7 +1486,6 @@ async def test_new_command_names_created_codex_task(
     expected_title = _discord_thread_title(
         "test Discord thread",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", expected_title, "test Discord thread")
@@ -1526,7 +1513,6 @@ async def test_new_from_command_uses_raw_discord_name_guard(
     expected_title = _discord_thread_title(
         "Test server / #m7 / raw thread name",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", expected_title, "raw thread name")
@@ -1564,7 +1550,6 @@ async def test_new_command_reuses_semantic_name_from_rendered_discord_title(
     expected_title = _discord_thread_title(
         "Semantic task",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", expected_title, previous_discord_title)
@@ -1606,7 +1591,6 @@ async def test_new_command_uses_manual_discord_title_as_semantic_name(
     expected_title = _discord_thread_title(
         "Human title",
         str(gateway.settings.default_cwd),
-        "thread-created",
     )
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", expected_title, previous_discord_title)
@@ -1644,8 +1628,8 @@ async def test_message_recovers_active_turn_after_stale_start_failure(
     gateway: DiscordCodexGateway,
 ) -> None:
     """A failed start resumes and steers an active turn without lock re-entry."""
-    idle_title = "✅ Task name | tmp/project | codex-thread"
-    working_title = "⏳ Task name | tmp/project | codex-thread"
+    idle_title = "✅ Task name | tmp/project"
+    working_title = "⏳ Task name | tmp/project"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1682,8 +1666,8 @@ async def test_interrupt_updates_title_for_discovered_active_turn(
     gateway: DiscordCodexGateway,
 ) -> None:
     """Interrupt marks the title working when resume discovers an active turn."""
-    idle_title = "✅ Task name | tmp/project | codex-thread"
-    working_title = "⏳ Task name | tmp/project | codex-thread"
+    idle_title = "✅ Task name | tmp/project"
+    working_title = "⏳ Task name | tmp/project"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -1714,8 +1698,8 @@ async def test_interrupt_updates_title_for_discovered_idle_task(
     gateway: DiscordCodexGateway,
 ) -> None:
     """Interrupt restores the check mark when resume finds no active turn."""
-    working_title = "⏳ Task name | tmp/project | codex-thread"
-    idle_title = "✅ Task name | tmp/project | codex-thread"
+    working_title = "⏳ Task name | tmp/project"
+    idle_title = "✅ Task name | tmp/project"
     gateway.bindings.bind(
         CodexTaskBinding(
             "discord-thread",
@@ -2342,10 +2326,7 @@ async def test_resume_from_command_uses_raw_discord_name_guard(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            (
-                "✅ Mapped task | tmp/project | "
-                "11111111-1111-1111-1111-111111111111"
-            ),
+            "✅ Mapped task | tmp/project",
             "raw thread name",
         )
     ]
@@ -2371,10 +2352,7 @@ async def test_resume_from_command_uses_stored_discord_title_guard(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            (
-                "✅ Mapped task | tmp/project | "
-                "11111111-1111-1111-1111-111111111111"
-            ),
+            "✅ Mapped task | tmp/project",
             "✅ Previous task | tmp/previous | previous-thread",
         )
     ]
@@ -2409,7 +2387,7 @@ async def test_refresh_task_migrates_contextual_discord_title_guard(
 
     response = await gateway.handle_message(FakeMessageEvent("/refresh"))
 
-    rendered_title = "✅ Mapped task | tmp/project | codex-thread"
+    rendered_title = "✅ Mapped task | tmp/project"
     assert response.startswith("Refreshed Codex task `codex-thread`.")
     assert gateway.adapter.renamed_threads == [
         ("discord-thread", rendered_title, contextual_guard)
@@ -2458,12 +2436,12 @@ async def test_refresh_replays_each_missing_history_item_once(
     assert gateway.adapter.renamed_threads == [
         (
             "discord-thread",
-            "✅ Mapped task | tmp/project | codex-thread",
+            "✅ Mapped task | tmp/project",
             "Previous task",
         )
     ]
     assert gateway.bindings.bindings["discord-thread"].discord_title == (
-        "✅ Mapped task | tmp/project | codex-thread"
+        "✅ Mapped task | tmp/project"
     )
 
 

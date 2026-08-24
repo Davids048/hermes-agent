@@ -92,34 +92,22 @@ def _parent_and_working_directory(cwd: str) -> str:
 def _discord_thread_title(
     name: str,
     cwd: str,
-    codex_thread_id: str,
     *,
     working: bool = False,
 ) -> str:
-    """Render a status-prefixed task identity within Discord's title limit."""
+    """Render a status-prefixed task name and directory for Discord."""
     cleaned_name = re.sub(r"\s+", " ", str(name or "Untitled task")).strip()
     cleaned_name = cleaned_name or "Untitled task"
     directory = re.sub(
         r"\s+", " ", _parent_and_working_directory(cwd)
     ).strip()
-    session_id = str(codex_thread_id or "").strip()
-    if not session_id:
-        raise ValueError("A Discord Codex thread title requires a session id")
-
     status_prefix = "⏳ " if working else "✅ "
     separator_units = utf16_len(_DISCORD_THREAD_TITLE_SEPARATOR)
-    fixed_units = (
-        utf16_len(status_prefix) + utf16_len(session_id) + 2 * separator_units
-    )
+    fixed_units = utf16_len(status_prefix) + separator_units
     # Reserve two UTF-16 units so any first Unicode code point can remain.
     directory_budget = _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS - fixed_units - 2
-    if directory_budget < 1:
-        raise ValueError("The Codex session id exceeds the Discord title budget")
     directory = _truncate_utf16_suffix(directory, directory_budget)
-    suffix = (
-        f"{_DISCORD_THREAD_TITLE_SEPARATOR}{directory}"
-        f"{_DISCORD_THREAD_TITLE_SEPARATOR}{session_id}"
-    )
+    suffix = f"{_DISCORD_THREAD_TITLE_SEPARATOR}{directory}"
     name_budget = (
         _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS
         - utf16_len(status_prefix)
@@ -1654,7 +1642,6 @@ class DiscordCodexGateway:
         discord_title = _discord_thread_title(
             title,
             cwd,
-            thread_id,
             working=thread_id in self.active_turns,
         )
         discord_chat_id = await self.adapter.create_codex_task_thread(
@@ -1721,7 +1708,6 @@ class DiscordCodexGateway:
             desired_discord_title = _discord_thread_title(
                 cleaned_title,
                 cwd or binding.cwd,
-                binding.codex_thread_id,
                 working=thread_id in self.active_turns,
             )
             if desired_discord_title == expected_discord_title:
