@@ -35,6 +35,7 @@ _RECONNECT_MAX_DELAY_SECONDS = 30.0
 _ROLLOUT_RETRY_INITIAL_DELAY_SECONDS = 0.5
 _ROLLOUT_RETRY_MAX_DELAY_SECONDS = 30.0
 _STREAM_EDIT_INTERVAL_SECONDS = 0.75
+_ACTIVITY_EDIT_INTERVAL_SECONDS = 2.0
 _HISTORY_PAGE_SIZE = 100
 _DISCORD_THREAD_TITLE_MAX_UTF16_UNITS = 80
 _DISCORD_THREAD_TITLE_SEPARATOR = " | "
@@ -294,6 +295,30 @@ class CodexTaskBindingStore:
             return
         binding.item_deliveries[item_id] = delivery
         self._save()
+
+    def record_item_deliveries(
+        self,
+        discord_chat_id: str,
+        item_ids: set[str],
+        delivery: CodexItemDelivery,
+    ) -> None:
+        """Persist one shared Discord delivery for completed activity items."""
+        binding = self.bindings.get(discord_chat_id)
+        if binding is None:
+            return
+        changed = False
+        for item_id in item_ids:
+            if not item_id:
+                continue
+            stored = binding.item_deliveries.get(item_id)
+            if stored == delivery or (
+                stored is not None and stored.final and not delivery.final
+            ):
+                continue
+            binding.item_deliveries[item_id] = delivery
+            changed = True
+        if changed:
+            self._save()
 
     def set_discord_message_pending(
         self,
@@ -674,9 +699,11 @@ class DiscordTurnDisplay:
 
     status_message_id: Optional[str] = None
     details: dict[str, DiscordActivityDetail] = field(default_factory=dict)
+    pending_delivery_item_ids: set[str] = field(default_factory=set)
     status: str = "inProgress"
     legacy_split_messages: bool = False
     rendered_on_connection: bool = False
+    flush_task: Optional[asyncio.Task[None]] = None
 
 
 @dataclass(frozen=True)
@@ -745,6 +772,10 @@ class DiscordCodexGateway:
             stream.flush_task
             for stream in self.stream_messages.values()
             if stream.flush_task is not None
+        ] + [
+            display.flush_task
+            for display in self.turn_displays.values()
+            if display.flush_task is not None
         ]
         for task in tasks:
             task.cancel()
@@ -1230,6 +1261,10 @@ class DiscordCodexGateway:
             stream.flush_task
             for stream in self.stream_messages.values()
             if stream.flush_task is not None and not stream.flush_task.done()
+        ] + [
+            display.flush_task
+            for display in self.turn_displays.values()
+            if display.flush_task is not None and not display.flush_task.done()
         ]
         for task in tasks:
             task.cancel()
@@ -1353,8 +1388,8 @@ class DiscordCodexGateway:
         if display is None:
             return
         display.status = status
-        if display.rendered_on_connection:
-            await self._update_turn_activity_locked(chat_id, turn_id, display)
+        if display.rendered_on_connection or display.pending_delivery_item_ids:
+            await self._flush_turn_activity_now_locked(chat_id, turn_id, display)
         elif (
             display.status_message_id
             and display.details
@@ -1942,7 +1977,7 @@ class DiscordCodexGateway:
             if display is None:
                 return
             display.status = str(turn.get("status") or "completed")
-            await self._update_turn_activity_locked(chat_id, turn_id, display)
+            await self._flush_turn_activity_now_locked(chat_id, turn_id, display)
             self.turn_displays.pop((chat_id, turn_id), None)
 
     async def _set_turn_activity_detail_locked(
@@ -1956,7 +1991,7 @@ class DiscordCodexGateway:
         failed: bool = False,
         final: bool = False,
     ) -> Optional[str]:
-        """Update one detail inside the turn-owned Discord activity message."""
+        """Record one detail and schedule a combined Discord activity edit."""
         display = self.turn_displays.setdefault(
             (chat_id, turn_id), DiscordTurnDisplay()
         )
@@ -1965,18 +2000,53 @@ class DiscordCodexGateway:
             kind=kind,
             failed=failed,
         )
-        await self._update_turn_activity_locked(chat_id, turn_id, display)
-        message_id = display.status_message_id
-        if final and message_id:
-            self.bindings.record_item_delivery(
-                chat_id,
-                item_id,
-                CodexItemDelivery(
-                    discord_message_id=message_id,
-                    final=True,
-                ),
+        if final:
+            display.pending_delivery_item_ids.add(item_id)
+        if display.flush_task is None or display.flush_task.done():
+            display.flush_task = asyncio.create_task(
+                self._flush_turn_activity(chat_id, turn_id),
+                name=f"codex-discord-activity-{turn_id}",
             )
-        return message_id
+        return display.status_message_id
+
+    async def _flush_turn_activity(self, chat_id: str, turn_id: str) -> None:
+        """Publish the latest combined activity after the coalescing interval."""
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(_ACTIVITY_EDIT_INTERVAL_SECONDS)
+            lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+            async with lock:
+                display = self.turn_displays.get((chat_id, turn_id))
+                if display is not None:
+                    await self._update_turn_activity_locked(
+                        chat_id, turn_id, display
+                    )
+        finally:
+            display = self.turn_displays.get((chat_id, turn_id))
+            if display is not None and display.flush_task is task:
+                display.flush_task = None
+
+    async def _cancel_turn_activity_flush_locked(
+        self, display: DiscordTurnDisplay
+    ) -> None:
+        """Cancel a delayed activity edit while the Discord thread lock is held."""
+        task = display.flush_task
+        display.flush_task = None
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _flush_turn_activity_now_locked(
+        self,
+        chat_id: str,
+        turn_id: str,
+        display: DiscordTurnDisplay,
+    ) -> None:
+        """Publish the latest combined activity without waiting for the interval."""
+        await self._cancel_turn_activity_flush_locked(display)
+        await self._update_turn_activity_locked(chat_id, turn_id, display)
 
     async def _update_turn_activity_locked(
         self,
@@ -2008,6 +2078,16 @@ class DiscordCodexGateway:
         if result.success and result.message_id:
             display.status_message_id = str(result.message_id)
             display.rendered_on_connection = True
+            if display.pending_delivery_item_ids:
+                self.bindings.record_item_deliveries(
+                    chat_id,
+                    set(display.pending_delivery_item_ids),
+                    CodexItemDelivery(
+                        discord_message_id=display.status_message_id,
+                        final=True,
+                    ),
+                )
+                display.pending_delivery_item_ids.clear()
 
     def _collapsed_turn_activity(self, display: DiscordTurnDisplay) -> str:
         """Summarize a turn's activity counts for the default collapsed view."""
@@ -2214,6 +2294,11 @@ class DiscordCodexGateway:
         if item_type == "agentMessage":
             if not final:
                 return
+            display = self.turn_displays.get((chat_id, turn_id))
+            if display is not None and display.pending_delivery_item_ids:
+                await self._flush_turn_activity_now_locked(
+                    chat_id, turn_id, display
+                )
             await self._finalize_text_item(
                 chat_id,
                 turn_id,
@@ -2311,6 +2396,7 @@ class DiscordCodexGateway:
         if display is None or not display.status_message_id:
             result = await self.adapter.send(chat_id, text, metadata=metadata)
             return str(result.message_id) if result.success and result.message_id else None
+        await self._cancel_turn_activity_flush_locked(display)
         result = await self.adapter.edit_message(
             chat_id,
             display.status_message_id,

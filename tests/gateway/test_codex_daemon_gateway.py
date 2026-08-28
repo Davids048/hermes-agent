@@ -2326,6 +2326,162 @@ async def test_show_item_collapses_activity_and_separates_final_answer(
 
 
 @pytest.mark.asyncio
+async def test_set_turn_activity_detail_locked_coalesces_completed_items(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A burst of completed activity creates one state save and Discord edit."""
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    await gateway.handle_notification(
+        "turn/started",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "inProgress"},
+        },
+    )
+    save_count = 0
+    original_save = gateway.bindings._save
+
+    def count_save() -> None:
+        """Count persistent mapping writes while preserving their behavior."""
+        nonlocal save_count
+        save_count += 1
+        original_save()
+
+    monkeypatch.setattr(gateway.bindings, "_save", count_save)
+    for index in range(100):
+        await gateway.handle_notification(
+            "item/completed",
+            {
+                "threadId": "codex-thread",
+                "turnId": "turn-1",
+                "item": {
+                    "id": f"commentary-{index}",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": f"Update {index}",
+                },
+            },
+        )
+
+    assert gateway.adapter.edited == []
+    assert save_count == 0
+
+    await gateway.handle_notification(
+        "item/completed",
+        {
+            "threadId": "codex-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "answer-1",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "All updates completed.",
+            },
+        },
+    )
+
+    assert len(gateway.adapter.edited) == 1
+    assert gateway.adapter.edited[0][2] == (
+        "⏳ **Activity · 100 steps**\n100 updates"
+    )
+    assert gateway.adapter.sent[-1] == (
+        "discord-thread",
+        "All updates completed.",
+    )
+    assert save_count == 2
+    for index in range(100):
+        assert gateway.bindings.item_delivery(
+            "discord-thread", f"commentary-{index}"
+        ) == CodexItemDelivery(discord_message_id="1", final=True)
+
+    await gateway.handle_notification(
+        "turn/completed",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "completed"},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_flush_turn_activity_publishes_periodic_batches(
+    gateway: DiscordCodexGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-running turn publishes one edit for each elapsed activity interval."""
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._ACTIVITY_EDIT_INTERVAL_SECONDS", 0
+    )
+    gateway.bindings.bind(
+        CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
+    )
+    await gateway.handle_notification(
+        "turn/started",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "inProgress"},
+        },
+    )
+
+    for index in range(3):
+        await gateway.handle_notification(
+            "item/completed",
+            {
+                "threadId": "codex-thread",
+                "turnId": "turn-1",
+                "item": {
+                    "id": f"first-update-{index}",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": f"First update {index}",
+                },
+            },
+        )
+    display = gateway.turn_displays[("discord-thread", "turn-1")]
+    if display.flush_task is not None:
+        await display.flush_task
+
+    assert len(gateway.adapter.edited) == 1
+    assert gateway.adapter.edited[-1][2] == (
+        "⏳ **Activity · 3 steps**\n3 updates"
+    )
+
+    for index in range(2):
+        await gateway.handle_notification(
+            "item/completed",
+            {
+                "threadId": "codex-thread",
+                "turnId": "turn-1",
+                "item": {
+                    "id": f"second-update-{index}",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": f"Second update {index}",
+                },
+            },
+        )
+    display = gateway.turn_displays[("discord-thread", "turn-1")]
+    if display.flush_task is not None:
+        await display.flush_task
+
+    assert len(gateway.adapter.edited) == 2
+    assert gateway.adapter.edited[-1][2] == (
+        "⏳ **Activity · 5 steps**\n5 updates"
+    )
+
+    await gateway.handle_notification(
+        "turn/completed",
+        {
+            "threadId": "codex-thread",
+            "turn": {"id": "turn-1", "status": "completed"},
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_sync_task_history_restores_aggregated_activity_controls(
     gateway: DiscordCodexGateway,
 ) -> None:
@@ -2516,6 +2672,9 @@ async def test_command_output_delta_preserves_command_and_live_output(
     monkeypatch.setattr(
         "gateway.codex_daemon_gateway._STREAM_EDIT_INTERVAL_SECONDS", 0
     )
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._ACTIVITY_EDIT_INTERVAL_SECONDS", 0
+    )
     gateway.bindings.bind(
         CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
     )
@@ -2549,6 +2708,9 @@ async def test_command_output_delta_preserves_command_and_live_output(
         },
     )
     await gateway.stream_messages[("discord-thread", "command-1")].flush_task
+    display = gateway.turn_displays[("discord-thread", "turn-1")]
+    if display.flush_task is not None:
+        await display.flush_task
 
     collapsed = gateway.adapter.edited[-1][2]
     expanded = gateway.adapter.edited_metadata[-1]["expanded_content"]
@@ -2565,6 +2727,9 @@ async def test_reasoning_summary_stream_finishes_with_authoritative_parts(
     """User-visible reasoning summaries stream and finish without raw reasoning."""
     monkeypatch.setattr(
         "gateway.codex_daemon_gateway._STREAM_EDIT_INTERVAL_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        "gateway.codex_daemon_gateway._ACTIVITY_EDIT_INTERVAL_SECONDS", 0
     )
     gateway.bindings.bind(
         CodexTaskBinding("discord-thread", "codex-thread", "/tmp/project")
@@ -2587,6 +2752,9 @@ async def test_reasoning_summary_stream_finishes_with_authoritative_parts(
         },
     )
     await gateway.stream_messages[("discord-thread", "reasoning-1")].flush_task
+    display = gateway.turn_displays[("discord-thread", "turn-1")]
+    if display.flush_task is not None:
+        await display.flush_task
     await gateway.handle_notification(
         "item/completed",
         {
@@ -2600,6 +2768,9 @@ async def test_reasoning_summary_stream_finishes_with_authoritative_parts(
             },
         },
     )
+    display = gateway.turn_displays[("discord-thread", "turn-1")]
+    if display.flush_task is not None:
+        await display.flush_task
 
     assert gateway.adapter.edited[-1][0:3] == (
         "discord-thread",
